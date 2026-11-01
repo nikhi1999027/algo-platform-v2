@@ -32,13 +32,17 @@ Impact: Eliminates peak-chasing entries and prevents calculation anomalies.
 Dependencies: numpy, pandas.
 Tests: Validated on synthetic test suites and live historical feeds.
 ------------------------------------------------------------
-[UPGRADE-004] Phase 4: Transparent Market Scanner & Leader Display
-Reason: In RISK-OFF regimes (-20 penalty), scanner completely hid the table
-        if all stocks fell below cutoff score (e.g., 65 or 55).
-Action: Added 'Show all ranked leaders (Ignore cutoff)' toggle and transparent
-        status callouts in render_scanner().
-Impact: Traders can view relative-strength leaders defying broader weakness.
-Dependencies: streamlit, pandas.
+[UPGRADE-004] Phase 4: Sector Breadth, Granular Regimes & Event-Risk Intelligence
+Reason: Blanket -20 penalty in RISK-OFF suppressed leading stocks whose individual
+        sectors were rallying independently (e.g. Pharma or Banking).
+Action: 1. Built STOCK_SECTOR_MAP and SECTOR_INDICES for major Indian sectors.
+        2. Added get_sector_regimes() to evaluate 50-SMA health across sectors.
+        3. Updated score_setup() to waive the -20 penalty down to -5 if the stock's
+           sector is BULLISH.
+        4. Enhanced event-risk detection for upcoming corporate earnings.
+Impact: Distinguishes resilient sector leaders from macro breakdowns.
+Dependencies: yfinance, pandas, numpy.
+Tests: Validated against current market regime and sectoral index feeds.
 ============================================================
 """
 import streamlit as st
@@ -56,7 +60,7 @@ import warnings
 from datetime import datetime, timedelta, date, timezone
 from zoneinfo import ZoneInfo
 
-# Suppress internal third-party library deprecation warnings
+# Suppress internal third-party library deprecation warnings from console logs
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*inplace keyword in DataFrame.*")
 
@@ -92,6 +96,27 @@ INDEX_DICT = {
     "BANK NIFTY": {"yf": "^NSEBANK", "nse": "BANKNIFTY", "step": 100, "lot": 30, "weekly": False},
 }
 UNDERLYING_YF = {v["nse"]: v["yf"] for v in INDEX_DICT.values()}
+
+# Phase 4: Sectoral Indices and Mapping Dictionary
+SECTOR_INDICES = {
+    "BANK": "^NSEBANK",
+    "IT": "^CNXIT",
+    "PHARMA": "^CNXPHARMA",
+    "AUTO": "^CNXAUTO",
+    "FMCG": "^CNXFMCG",
+    "METAL": "^CNXMETAL"
+}
+
+STOCK_SECTOR_MAP = {
+    "HDFCBANK": "BANK", "ICICIBANK": "BANK", "SBIN": "BANK", "AXISBANK": "BANK", "KOTAKBANK": "BANK",
+    "INFY": "IT", "TCS": "IT", "HCLTECH": "IT", "WIPRO": "IT", "TECHM": "IT",
+    "SUNPHARMA": "PHARMA", "CIPLA": "PHARMA", "DRREDDY": "PHARMA", "ZYDUSLIFE": "PHARMA",
+    "MARUTI": "AUTO", "M&M": "AUTO", "EICHERMOT": "AUTO", "TMPV": "AUTO",
+    "TATASTEEL": "METAL", "JSWSTEEL": "METAL", "HINDALCO": "METAL",
+    "ITC": "FMCG", "HINDUNILVR": "FMCG", "TITAN": "FMCG", "TRENT": "FMCG",
+    "RELIANCE": "ENERGY", "NTPC": "ENERGY", "POWERGRID": "ENERGY", "ONGC": "ENERGY", "COALINDIA": "ENERGY",
+    "ADANIENSOL": "ENERGY", "BEL": "DEFENCE", "LT": "INFRA", "INDUSTOWER": "TELECOM"
+}
 
 FNO_WATCHLIST = [
     "RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "TCS", "TMPV", "SBIN", "BHARTIARTL", "AXISBANK", "LT",
@@ -313,7 +338,7 @@ def projected_rel_volume(df, market):
     return vol / vol_avg, False
 
 # ==============================================================================
-# 2. TECHNICAL INDICATOR ENGINE (MATHEMATICAL INTEGRITY)
+# 2. TECHNICAL INDICATOR ENGINE
 # ==============================================================================
 def calculate_sma(series, window=20):
     return series.rolling(window=window).mean()
@@ -401,7 +426,6 @@ def add_indicators(df_in):
     df["HV_Rank"] = df["HV20"].rolling(252, min_periods=120).rank(pct=True)
     df["TradedValue20"] = (c * df["Volume"]).rolling(20).mean()
     
-    # Multi-Timeframe Alignment: Weekly intermediate trend
     wk = c.resample("W-FRI").last().dropna()
     if len(wk) >= 30:
         w_ema = calculate_ema(wk, 10)
@@ -416,7 +440,7 @@ def add_indicators(df_in):
     return df
 
 # ==============================================================================
-# 3. MARKET REGIME & RELATIVE STRENGTH
+# 3. PHASE 4: MARKET REGIME & SECTOR BREADTH ENGINE
 # ==============================================================================
 def regime_series(bench_df):
     c = bench_df["Close"]
@@ -451,6 +475,23 @@ def get_market_regime(market):
         out["vix_pct"] = float((v.iloc[-252:] <= v.iloc[-1]).mean())
     return out
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_sector_regimes():
+    """Phase 4: Calculates whether each sectoral index is currently in a BULLISH or BEARISH state."""
+    tickers = list(SECTOR_INDICES.values())
+    data = download_many(tuple(tickers), period="1y")
+    sector_health = {}
+    for sec, sym in SECTOR_INDICES.items():
+        df = data.get(sym)
+        if df is not None and len(df) >= 50:
+            c = df["Close"]
+            s50 = calculate_sma(c, 50).iloc[-1]
+            cur = c.iloc[-1]
+            sector_health[sec] = "BULLISH" if cur >= s50 else "BEARISH"
+        else:
+            sector_health[sec] = "NEUTRAL"
+    return sector_health
+
 def rs_raw_score(close):
     n = len(close)
     def r(k):
@@ -470,9 +511,9 @@ def rs_proxy_rating(excess_63d_pct):
     return 25
 
 # ==============================================================================
-# 4. CONFLUENCE & LEADING-ENTRY SCORING ENGINE
+# 4. CONFLUENCE & SECTOR-AWARE SCORING ENGINE
 # ==============================================================================
-def score_setup(r, direction="long", rs_rating=None, regime="NEUTRAL", relvol=None, sentiment=None, earnings_days=None):
+def score_setup(r, symbol="", direction="long", rs_rating=None, regime="NEUTRAL", sector_health=None, relvol=None, sentiment=None, earnings_days=None):
     L = direction == "long"
     pts, mx, why, flags = 0.0, 0.0, [], []
 
@@ -582,13 +623,26 @@ def score_setup(r, direction="long", rs_rating=None, regime="NEUTRAL", relvol=No
         score -= 15
         flags.append("RSI Overbought/Oversold exhaustion")
 
+    # Phase 4: Granular Sector Breadth Check
+    stock_sector = STOCK_SECTOR_MAP.get(symbol)
+    sec_trend = (sector_health or {}).get(stock_sector, "NEUTRAL") if stock_sector else None
+
     if L and regime == "RISK-OFF":
-        score -= 20
-        flags.append("Market in RISK-OFF (High breakout failure rate)")
+        if sec_trend == "BULLISH":
+            score -= 5
+            flags.append(f"Broad market RISK-OFF, but {stock_sector} sector is BULLISH (mild -5 cushion)")
+        else:
+            score -= 20
+            flags.append("Market in RISK-OFF (High breakout failure rate)")
+
+    # Phase 4: Event Risk (Earnings within 5 days)
+    if earnings_days is not None and 0 <= earnings_days <= 5:
+        score -= 15
+        flags.append(f"Earnings in {earnings_days}d — binary gap risk!")
 
     score = max(0.0, min(100.0, score))
     grade = "A+" if score >= 85 else "A" if score >= 75 else "B" if score >= 65 else "C"
-    return {"score": round(score, 1), "grade": grade, "setup": setup, "why": why, "flags": flags}
+    return {"score": round(score, 1), "grade": grade, "setup": setup, "why": why, "flags": flags, "sector": stock_sector or "General"}
 
 def compute_levels(r, direction="long", atr_mult=1.8, entry=None, t1_r=2.0, t2_r=3.0):
     L = direction == "long"
@@ -920,6 +974,7 @@ def run_equity_scan(symbols, market, min_score, atr_mult, direction="long", chec
     yf_syms = [f"{s}{m['suffix']}" for s in symbols]
     data = download_many(tuple(yf_syms), "2y")
     regime = get_market_regime(market)
+    sector_health = get_sector_regimes() if market == "IN" else {}
     feats, skipped = {}, 0
     for s, t in zip(symbols, yf_syms):
         df = data.get(t)
@@ -939,10 +994,11 @@ def run_equity_scan(symbols, market, min_score, atr_mult, direction="long", chec
     for s, (ind, df) in feats.items():
         last = ind.iloc[-1]
         rv, projected = projected_rel_volume(df, market)
-        res = score_setup(last, direction, float(rs_rating[s]), regime["label"], relvol=rv)
+        res = score_setup(last, symbol=s, direction=direction, rs_rating=float(rs_rating[s]),
+                          regime=regime["label"], sector_health=sector_health, relvol=rv)
         lv = compute_levels(last, direction, atr_mult)
         rows.append({
-            "Symbol": s, "Score": res["score"], "Grade": res["grade"], "Setup Type": res["setup"],
+            "Symbol": s, "Sector": res["sector"], "Score": res["score"], "Grade": res["grade"], "Setup Type": res["setup"],
             f"Price ({m['ccy']})": round(_f(last["Close"]), 2), "RS Rating": int(rs_rating[s]),
             "Rel Vol": f"{rv:.2f}x{' (proj)' if projected else ''}" if rv == rv else "n/a",
             "RSI": round(_f(last["RSI"]), 1), "ADX": round(_f(last["ADX"]), 1), "ATR %": round(_f(last["ATR_Pct"]), 2),
@@ -975,10 +1031,10 @@ def render_scanner(market):
     show_all = col3.toggle("Show all ranked leaders (Ignore cutoff)", value=False, key=f"{k}_show_all",
                            help="Displays the highest-scoring stocks even if they fall below the strict entry cutoff.")
     
-    st.caption(r"Filters for non-extended leading entries (Pullbacks to 20-EMA & Bollinger Squeezes). Flags setups that are >1.8x ATR overextended.")
+    st.caption(r"Phase 4: Granular Sector-Breadth filtering & leading entry detection (Pullbacks to 20-EMA & Bollinger Squeezes).")
 
     if st.button("Run Market Scanner", key=f"btn_exec_{k}_equity_scan"):
-        with st.spinner("Screening universe for leading confluence setups..."):
+        with st.spinner("Screening universe with Sector-Breadth Intelligence..."):
             syms = fetch_indian_tickers(universe) if market == "IN" else fetch_us_tickers()
             res, regime, skipped = run_equity_scan(syms, market, c["min_score"], c["atr_mult"], check_earnings=chk_earn)
             st.session_state[f"scan_{k}"] = {
@@ -1064,6 +1120,7 @@ def render_deep_dive(market):
         ind = add_indicators(df)
         last = ind.iloc[-1]
         regime = get_market_regime(market)
+        sector_health = get_sector_regimes() if market == "IN" else {}
         excess = None
         if regime["bench_close"] is not None and len(ind) > 64:
             b = regime["bench_close"].reindex(ind.index, method="ffill")
@@ -1072,7 +1129,8 @@ def render_deep_dive(market):
         sent = fetch_live_news_sentiment(sym, market=market)
         ed = get_next_earnings(f"{sym}{m['suffix']}")
         rv, proj = projected_rel_volume(df, market)
-        res = score_setup(last, "long", rs, regime["label"], relvol=rv, sentiment=sent["score"], earnings_days=days_until(ed))
+        res = score_setup(last, symbol=sym, direction="long", rs_rating=rs, regime=regime["label"],
+                          sector_health=sector_health, relvol=rv, sentiment=sent["score"], earnings_days=days_until(ed))
         lv = compute_levels(last, "long", c["atr_mult"])
 
     regime_banner(regime, market)
@@ -1082,7 +1140,7 @@ def render_deep_dive(market):
     c1.metric("Current Price", f"{m['ccy']}{_f(last['Close']):,.2f}")
     c2.metric("Confluence Score", f"{res['score']} ({res['grade']})")
     c3.metric("Wilder's RSI (14)", round(_f(last["RSI"]), 1))
-    c4.metric("Setup Detected", res["setup"])
+    c4.metric("Sector", res["sector"])
     d1, d2, d3, d4 = st.columns(4)
     d1.metric("Dynamic Stop", f"{m['ccy']}{lv['stop']:,.2f}", f"-{lv['risk_pct']}%")
     d2.metric("Target (2R)", f"{lv['t1']:,.2f}")
@@ -1281,8 +1339,8 @@ elif app_mode == NAV[2]:
                     sent = fetch_live_news_sentiment(idx_name, market="IN")
                     chain = fetch_option_chain(meta["nse"], True)
                     
-                    lg = score_setup(last, "long", None, regime["label"], sentiment=sent["score"])
-                    sh = score_setup(last, "short", None, regime["label"], sentiment=sent["score"])
+                    lg = score_setup(last, symbol=meta["nse"], direction="long", rs_rating=None, regime=regime["label"], sentiment=sent["score"])
+                    sh = score_setup(last, symbol=meta["nse"], direction="short", rs_rating=None, regime=regime["label"], sentiment=sent["score"])
                     
                     spot = chain["spot"] if (chain and chain.get("spot") == chain.get("spot")) else _f(last["Close"])
                     exp_d, dte = pick_expiry(meta["nse"], chain, min_dte=2)
@@ -1368,9 +1426,9 @@ elif app_mode == NAV[4]:
         st.caption(f"Source: {src}")
         show_df(fii_data)
 
-# #################################################################=============
+# ##############################################################################
 # SECTION 6: US EQUITIES SWING TRADING DESK
-# #################################################################=============
+# ##############################################################################
 elif app_mode == NAV[5]:
     st.title("🗽 US Equities Multi-Indicator Swing Desk")
     us_tab_scan, us_tab_single, us_tab_sz = st.tabs(["🚀 US Market Scanner", "🔍 US Stock Deep Dive", "🧮 Position Sizer"])
