@@ -43,6 +43,18 @@ Action: 1. Built STOCK_SECTOR_MAP and SECTOR_INDICES for major Indian sectors.
 Impact: Distinguishes resilient sector leaders from macro breakdowns.
 Dependencies: yfinance, pandas, numpy.
 Tests: Validated against current market regime and sectoral index feeds.
+------------------------------------------------------------
+[UPGRADE-005] Phase 5: Recommendation & Risk Decision Engine
+Reason: Raw table data lacked clear 'Why Enter' vs 'Why Avoid' decision intelligence
+        and concrete order execution parameters for traders.
+Action: 1. Added render_trade_decision_card() with transparent positive edge factors
+           and risk vetoes.
+        2. Created actionable trade status classifications: READY TO ENTER,
+           WATCHLIST / WAIT, and NO-TRADE / CAPITAL PROTECTION.
+        3. Built automated order execution tickets calculating exact quantity,
+           capital outlay, and rupee/dollar risk limits.
+Impact: Turns mechanical scans into actionable, institutional-grade trade decisions.
+Dependencies: streamlit, pandas, numpy.
 ============================================================
 """
 import streamlit as st
@@ -97,7 +109,6 @@ INDEX_DICT = {
 }
 UNDERLYING_YF = {v["nse"]: v["yf"] for v in INDEX_DICT.values()}
 
-# Phase 4: Sectoral Indices and Mapping Dictionary
 SECTOR_INDICES = {
     "BANK": "^NSEBANK",
     "IT": "^CNXIT",
@@ -477,7 +488,6 @@ def get_market_regime(market):
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_sector_regimes():
-    """Phase 4: Calculates whether each sectoral index is currently in a BULLISH or BEARISH state."""
     tickers = list(SECTOR_INDICES.values())
     data = download_many(tuple(tickers), period="1y")
     sector_health = {}
@@ -666,6 +676,69 @@ def position_size(capital, risk_pct, entry, stop):
     if risk_ps <= 0 or entry <= 0:
         return 0
     return int(max(0, min((capital * risk_pct / 100.0) // risk_ps, capital // entry)))
+
+# ==============================================================================
+# PHASE 5: RECOMMENDATION & RISK DECISION ENGINE
+# ==============================================================================
+def render_trade_decision_card(row, market, capital, risk_pct):
+    m = MARKETS[market]
+    score = float(row["Score"])
+    flags = [f.strip() for f in str(row["Flags"]).split(";") if f.strip()]
+    why = [w.strip() for w in str(row["Why"]).split(";") if w.strip()]
+    entry = float(row[f"Price ({m['ccy']})"])
+    stop = float(row[f"Stop ({m['ccy']})"])
+    t1 = float(row[f"T1 2R ({m['ccy']})"])
+    t2 = float(row[f"T2 3R ({m['ccy']})"])
+    
+    qty = position_size(capital, risk_pct, entry, stop)
+    total_outlay = qty * entry
+    risk_rupees = qty * abs(entry - stop)
+    rr_ratio = abs(t1 - entry) / abs(entry - stop) if abs(entry - stop) > 0 else 0.0
+
+    # Decision Engine Classification Logic
+    if score >= 60 and not any("EXTENDED" in f for f in flags) and rr_ratio >= 1.8:
+        status_label = "🟢 READY TO ENTER (Confluence Validated)"
+        status_desc = "Setup shows structural alignment, acceptable risk distance, and attractive reward:risk."
+        box_type = st.success
+    elif score >= 40:
+        status_label = "🟡 WATCHLIST / PULLBACK REQUIRED"
+        status_desc = "Strong relative strength, but macro regime or distance from 20-EMA demands caution."
+        box_type = st.warning
+    else:
+        status_label = "🔴 NO-TRADE / CAPITAL PROTECTION"
+        status_desc = "Setup carries structural flaws, breakdown momentum, or binary event risks. Stand aside."
+        box_type = st.error
+
+    st.markdown("### 📋 Executive Trade Decision Card")
+    box_type(f"**Recommendation:** {status_label}\n\n{status_desc}")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**🟢 Why Enter (Positive Edge Factors):**")
+        if why:
+            for reason in why:
+                st.markdown(f"- {reason}")
+        else:
+            st.caption("No strong technical catalysts identified.")
+
+    with c2:
+        st.markdown("**⚠️ Why Avoid / Caution (Veto & Risk Factors):**")
+        if flags:
+            for flag in flags:
+                st.markdown(f"- {flag}")
+        else:
+            st.markdown("- Clean setup with no major risk flags.")
+
+    st.markdown("#### **🎯 Order Execution Ticket**")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Execution Order", f"BUY {qty} Shares")
+    m2.metric("Total Outlay", f"{m['ccy']}{total_outlay:,.2f}")
+    m3.metric("Hard Stop Loss", f"{m['ccy']}{stop:,.2f}", f"-{row['Risk %']}%")
+    m4.metric("Max Portfolio Risk", f"-{m['ccy']}{risk_rupees:,.2f}", f"{risk_pct}%")
+
+    o1, o2 = st.columns(2)
+    o1.info(f"**Target 1 (2R - Scale 50%):** {m['ccy']}{t1:,.2f}")
+    o2.success(f"**Target 2 (3R - Runner Exit):** {m['ccy']}{t2:,.2f}")
 
 # ==============================================================================
 # 5. DYNAMIC FUTURE-ONLY EXPIRY ENGINE
@@ -1031,10 +1104,10 @@ def render_scanner(market):
     show_all = col3.toggle("Show all ranked leaders (Ignore cutoff)", value=False, key=f"{k}_show_all",
                            help="Displays the highest-scoring stocks even if they fall below the strict entry cutoff.")
     
-    st.caption(r"Phase 4: Granular Sector-Breadth filtering & leading entry detection (Pullbacks to 20-EMA & Bollinger Squeezes).")
+    st.caption(r"Phase 5: Decision Intelligence & Order Ticket Generation.")
 
     if st.button("Run Market Scanner", key=f"btn_exec_{k}_equity_scan"):
-        with st.spinner("Screening universe with Sector-Breadth Intelligence..."):
+        with st.spinner("Screening universe and calculating decision cards..."):
             syms = fetch_indian_tickers(universe) if market == "IN" else fetch_us_tickers()
             res, regime, skipped = run_equity_scan(syms, market, c["min_score"], c["atr_mult"], check_earnings=chk_earn)
             st.session_state[f"scan_{k}"] = {
@@ -1076,25 +1149,30 @@ def render_scanner(market):
     )
 
     st.markdown("---")
-    st.markdown("#### **⚡ Add Candidate to Active Exit Engine**")
+    st.markdown("#### **⚡ Select Stock for Institutional Decision Card & Order Ticket**")
     a1, a2 = st.columns([3, 1])
-    sel = a1.selectbox("Select stock to track:", view["Symbol"].tolist(), key=f"sb_{k}_cand_sel")
+    sel = a1.selectbox("Select Candidate:", view["Symbol"].tolist(), key=f"sb_{k}_cand_sel")
+    
+    selected_row = view[view["Symbol"] == sel].iloc[0]
+    
+    # Phase 5: Render Decision Card and Order Ticket
+    render_trade_decision_card(selected_row, market, c[f"cap_{market}"], c["risk_pct"])
+    
     if a2.button("Track This Stock", key=f"btn_track_{k}_cand"):
-        row = view[view["Symbol"] == sel].iloc[0]
-        entry = float(row[f"Price ({m['ccy']})"])
-        stop = float(row[f"Stop ({m['ccy']})"])
+        entry = float(selected_row[f"Price ({m['ccy']})"])
+        stop = float(selected_row[f"Stop ({m['ccy']})"])
         qty = position_size(c[f"cap_{market}"], c["risk_pct"], entry, stop)
         new_entry = pd.DataFrame([{
             "Row_ID": uuid.uuid4().hex[:8], 
             "Symbol": sel, 
             "Entry_Price": entry,
-            "Target_Price": float(row[f"T1 2R ({m['ccy']})"]), 
+            "Target_Price": float(selected_row[f"T1 2R ({m['ccy']})"]), 
             "Stop_Loss": stop,
             "Entry_Date": datetime.now().strftime("%Y-%m-%d %H:%M"), 
             "Qty": qty,
             "Initial_Stop": stop, 
-            "ATR_Entry": float(row["ATR"]), 
-            "Setup": row["Setup Type"]
+            "ATR_Entry": float(selected_row["ATR"]), 
+            "Setup": selected_row["Setup Type"]
         }])
         key, fpath = PORTFOLIO_KEYS[market]
         st.session_state[key] = pd.concat([st.session_state[key], new_entry], ignore_index=True)
