@@ -1,0 +1,9 @@
+streamlit>=1.40
+yfinance>=0.2.50
+pandas>=2.1
+numpy
+requests
+feedparser
+vaderSentiment
+lxml
+tzdata
