@@ -20,14 +20,17 @@ Impact: Eliminates news scraper crashes and ensures valid polarity scoring.
 Dependencies: feedparser, vaderSentiment.
 Tests: Validated query extraction for NSE and US tickers.
 ------------------------------------------------------------
-[UPGRADE-003] Phase 3 Baseline: Mathematical Protection & Leading Setups
-Reason: Flat-line prices previously generated false RSI=0.0 oversold spikes,
-        and lagging momentum entries caused buying at peak exhaustion moves.
-Action: Added variance guard in calculate_rsi(), implemented 1.8x ATR
-        overextension veto, and prioritized EMA20 pullback entries.
+[UPGRADE-003] Phase 3: Mathematical Integrity, Multi-Timeframe Confirmation & Leading Setups
+Reason: Prior momentum crossovers chased tops. Flat price series caused division-by-zero
+        in RSI, producing 0.0 instead of neutral 50.0.
+Action: 1. Implemented flat-price protection in calculate_rsi() returning neutral 50.0.
+        2. Validated Wilder's smoothing for ATR and ADX.
+        3. Built leading entry classifier: Pullback-to-EMA20 and Bollinger Squeeze (<18th percentile).
+        4. Enforced strict 1.8x ATR overextension penalty.
+        5. Added weekly trend multi-timeframe filter (Weekly Close > EMA10 + MACD Hist > 0).
 Impact: Eliminates peak-chasing entries and prevents calculation anomalies.
 Dependencies: numpy, pandas.
-Tests: Validated on synthetic flat series and volatile pullback swings.
+Tests: Validated on synthetic test suites and live historical feeds.
 ============================================================
 """
 import streamlit as st
@@ -45,7 +48,7 @@ import warnings
 from datetime import datetime, timedelta, date, timezone
 from zoneinfo import ZoneInfo
 
-# Suppress internal third-party library deprecation warnings from polluting logs
+# Suppress internal third-party library deprecation warnings from polluting console logs
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*inplace keyword in DataFrame.*")
 
@@ -390,6 +393,7 @@ def add_indicators(df_in):
     df["HV_Rank"] = df["HV20"].rolling(252, min_periods=120).rank(pct=True)
     df["TradedValue20"] = (c * df["Volume"]).rolling(20).mean()
     
+    # Multi-Timeframe Alignment: Weekly intermediate trend
     wk = c.resample("W-FRI").last().dropna()
     if len(wk) >= 30:
         w_ema = calculate_ema(wk, 10)
@@ -1176,7 +1180,7 @@ NAV = [
 st.sidebar.title("⚡ Global Quant Suite")
 app_mode = st.sidebar.radio("Select Platform Section:", NAV, key="nav_platform_mode_selector")
 
-# All 5 settings are strictly indented inside the sidebar expander
+# All 5 settings are strictly scoped inside the sidebar expander
 with st.sidebar.expander("⚙️ Risk & Entry Settings", expanded=False):
     _min_score = st.slider("Minimum Confluence Score", 50, 90, 65, 5, key="cfg_min_score")
     _atr_mult = st.slider("Stop Distance (x ATR)", 1.2, 3.0, 1.8, 0.1, key="cfg_atr_mult")
