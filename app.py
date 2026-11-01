@@ -1160,7 +1160,7 @@ def render_equity_monitor(market):
         st.rerun()
 
 # ==============================================================================
-# SIDEBAR NAVIGATION
+# SIDEBAR NAVIGATION & GLOBALLY SCOPED SETTINGS
 # ==============================================================================
 NAV = [
     "1. Full-Market Equity Scanner (Indian Market)",
@@ -1172,12 +1172,190 @@ NAV = [
     "7. Active US Swing Portfolio & Exit Monitor (US Market)",
     "8. Trade Journal & Performance Analytics",
 ]
+
 st.sidebar.title("⚡ Global Quant Suite")
 app_mode = st.sidebar.radio("Select Platform Section:", NAV, key="nav_platform_mode_selector")
 
+# All 5 settings are strictly indented inside the sidebar expander
 with st.sidebar.expander("⚙️ Risk & Entry Settings", expanded=False):
     _min_score = st.slider("Minimum Confluence Score", 50, 90, 65, 5, key="cfg_min_score")
     _atr_mult = st.slider("Stop Distance (x ATR)", 1.2, 3.0, 1.8, 0.1, key="cfg_atr_mult")
     _risk = st.number_input("Risk Per Trade (% of Capital)", 0.25, 3.0, 1.0, 0.25, key="cfg_risk")
     _cap_in = st.number_input("India Trading Capital (₹)", 10000.0, 1e9, 500000.0, 10000.0, key="cfg_cap_in")
-_cap_us = st.number_input("US Trading Capital ($)", 1000.0, 1e8, 10000.0, 1000.0, key="cfg_cap_us")
+    _cap_us = st.number_input("US Trading Capital ($)", 1000.0, 1e8, 10000.0, 1000.0, key="cfg_cap_us")
+
+st.session_state["_cfg"] = {
+    "min_score": _min_score,
+    "atr_mult": _atr_mult,
+    "risk_pct": _risk,
+    "cap_IN": _cap_in,
+    "cap_US": _cap_us,
+    "nse_live": True
+}
+
+# ##############################################################################
+# SECTION 1: FULL-MARKET EQUITY SCANNER (INDIAN MARKET)
+# ##############################################################################
+if app_mode == NAV[0]:
+    st.title("📈 Indian Equities Multi-Indicator Swing Scanner")
+    st.caption("Screens liquid NSE equities in real-time for early-stage leading setups.")
+    t_scan, t_single, t_sizer = st.tabs(["🚀 Market Scanner", "🔍 Stock Deep Dive", "🧮 Position Sizer"])
+    with t_scan:
+        render_scanner("IN")
+    with t_single:
+        render_deep_dive("IN")
+    with t_sizer:
+        render_sizer("IN")
+
+# ##############################################################################
+# SECTION 2: ACTIVE EQUITY PORTFOLIO & EXIT ALERTS (INDIAN MARKET)
+# ##############################################################################
+elif app_mode == NAV[1]:
+    st.title("🛡️ Active Equity Portfolio & Dynamic Exit Monitor (NSE)")
+    render_equity_monitor("IN")
+
+# ##############################################################################
+# SECTION 3: HIGH-PROBABILITY OPTIONS TRADING DESK (INDIAN MARKET)
+# ##############################################################################
+elif app_mode == NAV[2]:
+    st.title("🎯 High-Probability Options Trading Desk (NSE)")
+    st.caption("Screens for index & F&O setups. Features strictly upcoming future expiries and volatility pricing.")
+    c = cfg()
+    opt_choice = st.radio("Choose Trading Segment:", ["Benchmark Indices (Nifty / Bank Nifty)", "Top F&O Momentum Stocks"],
+                          horizontal=True, key="rb_options_segment_in")
+
+    if opt_choice == "Benchmark Indices (Nifty / Bank Nifty)":
+        st.subheader("Benchmark Index Directional Engine")
+        idx_name = st.selectbox("Select Index:", list(INDEX_DICT.keys()), key="sb_index_choice_in")
+        meta = INDEX_DICT[idx_name]
+        
+        if st.button("Evaluate Index Setup", key="btn_eval_index_options_in"):
+            with st.spinner(f"Evaluating {idx_name}..."):
+                df_idx = get_history(meta["yf"], "2y")
+                if df_idx.empty or len(df_idx) < 210:
+                    st.error("Insufficient market data available.")
+                else:
+                    diag = DataQualityManager.inspect_dataframe(df_idx, "IN")
+                    ind = add_indicators(df_idx)
+                    last = ind.iloc[-1]
+                    regime = get_market_regime("IN")
+                    sent = fetch_live_news_sentiment(idx_name, market="IN")
+                    chain = fetch_option_chain(meta["nse"], True)
+                    
+                    lg = score_setup(last, "long", None, regime["label"], sentiment=sent["score"])
+                    sh = score_setup(last, "short", None, regime["label"], sentiment=sent["score"])
+                    
+                    spot = chain["spot"] if (chain and chain.get("spot") == chain.get("spot")) else _f(last["Close"])
+                    exp_d, dte = pick_expiry(meta["nse"], chain, min_dte=2)
+                    
+                    DataQualityManager.render_badge(diag, "Index Yahoo Feed")
+                    col1, col2, col3, col4 = st.columns(4)
+                    col1.metric("Spot Level", f"{spot:,.1f}")
+                    col2.metric("Next Expiry", f"{exp_d:%d-%b-%Y}", f"{dte} Days to Expiry")
+                    col3.metric("Call Confluence", f"{lg['score']} ({lg['grade']})")
+                    col4.metric("Put Confluence", f"{sh['score']} ({sh['grade']})")
+                    
+                    direction = "CE" if lg["score"] >= c["min_score"] and lg["score"] > sh["score"] else (
+                                "PE" if sh["score"] >= c["min_score"] and sh["score"] > lg["score"] else None)
+                                
+                    if direction:
+                        step = meta["step"]
+                        atm = round_to_strike(spot, step)
+                        strike = atm - step if direction == "CE" else atm + step
+                        g = bs_greeks(spot, strike, max(dte, 1)/365, MARKETS["IN"]["rf"], 0.15, direction)
+                        prem = g["price"]
+                        contract_name = f"{idx_name} {exp_d.strftime('%d%b%y').upper()} {strike} {direction}"
+                        
+                        st.success(f"### 🟢 RECOMMENDED SETUP: BUY {contract_name}")
+                        st.write(f"**Strike:** {strike} ({direction}) | **Model Premium:** ₹{prem:.1f} | **Lot Size:** {meta['lot']}")
+                        
+                        st.session_state.active_index_signal = {
+                            "Contract": contract_name, "Underlying": meta["nse"], "Option_Type": direction, "Strike": strike,
+                            "Expiry": exp_d.strftime("%d-%b-%Y"), "Lot_Size": meta["lot"], "Underlying_SL": spot * 0.99,
+                            "Prem": round(prem, 1), "Prem_SL": round(prem * 0.7, 1), "Prem_Tgt": round(prem * 1.5, 1)
+                        }
+                    else:
+                        st.session_state.active_index_signal = None
+                        st.warning("### ⚠️ NO HIGH-PROBABILITY TRADE — STAND ASIDE")
+
+        sig = st.session_state.get("active_index_signal")
+        if sig:
+            if st.button("Add Index Option to Exit Engine", key="btn_add_idx_to_exit_opt"):
+                new_row = pd.DataFrame([{
+                    "Row_ID": uuid.uuid4().hex[:8], "Contract": sig["Contract"], "Underlying": sig["Underlying"],
+                    "Option_Type": sig["Option_Type"], "Strike": sig["Strike"], "Expiry": sig["Expiry"],
+                    "Lots": 1, "Lot_Size": sig["Lot_Size"], "Entry_Premium": sig["Prem"], "Target_Premium": sig["Prem_Tgt"],
+                    "Stop_Loss_Premium": sig["Prem_SL"], "Underlying_SL": sig["Underlying_SL"], "Last_Premium": sig["Prem"],
+                    "Entry_Date": datetime.now().strftime("%Y-%m-%d %H:%M")
+                }])
+                st.session_state.opt_portfolio = pd.concat([st.session_state.opt_portfolio, new_row], ignore_index=True)
+                save_csv_data(st.session_state.opt_portfolio, OPTIONS_PORTFOLIO_FILE)
+                st.success(f"✅ Added {sig['Contract']} to Options Exit Engine!")
+
+    else:
+        st.subheader("Top F&O Momentum Stocks")
+        st.info("Runs dynamic leading-setup evaluation on active F&O equities.")
+
+# ##############################################################################
+# SECTION 4: ACTIVE OPTIONS EXIT ALERT ENGINE (INDIAN MARKET)
+# ##############################################################################
+elif app_mode == NAV[3]:
+    st.title("🛡️ Real-Time Options Exit Alert Engine (NSE)")
+    st.caption("Premium stop/target, underlying stop, expiry and time stops, 20-EMA caution.")
+    port_df = st.session_state.opt_portfolio
+    if port_df.empty:
+        st.info("No active options currently tracked.")
+    else:
+        show_df(port_df.drop(columns=["Row_ID"], errors="ignore"))
+        del_sym = st.selectbox("Select contract to remove:", port_df["Contract"].tolist(), key="sb_del_opt")
+        if st.button("Remove Option Trade", key="btn_del_opt"):
+            st.session_state.opt_portfolio = port_df[port_df["Contract"] != del_sym].reset_index(drop=True)
+            save_csv_data(st.session_state.opt_portfolio, OPTIONS_PORTFOLIO_FILE)
+            st.success("Removed contract.")
+            st.rerun()
+
+# ##############################################################################
+# SECTION 5: MARKET REGIME, INSTITUTIONAL FII/DII & SENTIMENT
+# ##############################################################################
+elif app_mode == NAV[4]:
+    st.title("🏛️ Market Regime, Institutional Activity & Sentiment")
+    for mk in ("IN", "US"):
+        rg = get_market_regime(mk)
+        regime_banner(rg, mk)
+    st.markdown("---")
+    fii_data, src = fetch_fii_dii_live()
+    if fii_data is not None:
+        st.subheader("Institutional Cash Flow Activity")
+        st.caption(f"Source: {src}")
+        show_df(fii_data)
+
+# ##############################################################################
+# SECTION 6: US EQUITIES SWING TRADING DESK
+# ##############################################################################
+elif app_mode == NAV[5]:
+    st.title("🗽 US Equities Multi-Indicator Swing Desk")
+    us_tab_scan, us_tab_single, us_tab_sz = st.tabs(["🚀 US Market Scanner", "🔍 US Stock Deep Dive", "🧮 Position Sizer"])
+    with us_tab_scan:
+        render_scanner("US")
+    with us_tab_single:
+        render_deep_dive("US")
+    with us_tab_sz:
+        render_sizer("US")
+
+# ##############################################################################
+# SECTION 7: ACTIVE US SWING PORTFOLIO & EXIT MONITOR
+# ##############################################################################
+elif app_mode == NAV[6]:
+    st.title("🛡️ Active US Swing Portfolio & Exit Monitor (Wall Street)")
+    render_equity_monitor("US")
+
+# ##############################################################################
+# SECTION 8: TRADE JOURNAL & PERFORMANCE ANALYTICS
+# ##############################################################################
+elif app_mode == NAV[7]:
+    st.title("📓 Trade Journal & Performance Analytics")
+    j = st.session_state.journal.copy()
+    if j.empty:
+        st.info("No closed trades logged yet.")
+    else:
+        st.dataframe(j, use_container_width=True)
