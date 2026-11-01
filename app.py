@@ -1179,4 +1179,5 @@ with st.sidebar.expander("⚙️ Risk & Entry Settings", expanded=False):
     _min_score = st.slider("Minimum Confluence Score", 50, 90, 65, 5, key="cfg_min_score")
     _atr_mult = st.slider("Stop Distance (x ATR)", 1.2, 3.0, 1.8, 0.1, key="cfg_atr_mult")
     _risk = st.number_input("Risk Per Trade (% of Capital)", 0.25, 3.0, 1.0, 0.25, key="cfg_risk")
-    _cap_in = st.number_input("India Trading Capital (₹)", 10000.0, 1e9,
+    _cap_in = st.number_input("India Trading Capital (₹)", 10000.0, 1e9, 500000.0, 10000.0, key="cfg_cap_in")
+_cap_us = st.number_input("US Trading Capital ($)", 1000.0, 1e8, 10000.0, 1000.0, key="cfg_cap_us")
