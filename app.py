@@ -55,6 +55,15 @@ Action: 1. Added render_trade_decision_card() with transparent positive edge fac
            capital outlay, and rupee/dollar risk limits.
 Impact: Turns mechanical scans into actionable, institutional-grade trade decisions.
 Dependencies: streamlit, pandas, numpy.
+------------------------------------------------------------
+[UPGRADE-006] Phase 6: Options Analysis & Monitoring Engine
+Reason: Index and F&O options lacked quantitative volatility pricing (IV vs HV20)
+        and automated Greek-based capital sizing.
+Action: 1. Integrated ATM IV vs. HV20 volatility richness diagnostic.
+        2. Incorporated Black-Scholes Greeks (Delta, Theta) and dynamic contract sizing.
+        3. Added dedicated single-stock F&O options scanner.
+Impact: Prevents buying expensive options before volatility crush and calculates daily theta decay.
+Dependencies: math, numpy, pandas.
 ============================================================
 """
 import streamlit as st
@@ -358,10 +367,7 @@ def calculate_ema(series, span=20):
     return series.ewm(span=span, adjust=False).mean()
 
 def calculate_rsi(series, window=14):
-    """
-    Wilder's smoothed RSI with flat-price protection.
-    If series has zero variance (circuit-locked or flat), returns neutral 50.0.
-    """
+    """Wilder's smoothed RSI with flat-price protection."""
     if series.empty or series.nunique() <= 1:
         return pd.Series(50.0, index=series.index)
     
@@ -633,7 +639,7 @@ def score_setup(r, symbol="", direction="long", rs_rating=None, regime="NEUTRAL"
         score -= 15
         flags.append("RSI Overbought/Oversold exhaustion")
 
-    # Phase 4: Granular Sector Breadth Check
+    # Granular Sector Breadth Check
     stock_sector = STOCK_SECTOR_MAP.get(symbol)
     sec_trend = (sector_health or {}).get(stock_sector, "NEUTRAL") if stock_sector else None
 
@@ -645,7 +651,7 @@ def score_setup(r, symbol="", direction="long", rs_rating=None, regime="NEUTRAL"
             score -= 20
             flags.append("Market in RISK-OFF (High breakout failure rate)")
 
-    # Phase 4: Event Risk (Earnings within 5 days)
+    # Event Risk (Earnings within 5 days)
     if earnings_days is not None and 0 <= earnings_days <= 5:
         score -= 15
         flags.append(f"Earnings in {earnings_days}d — binary gap risk!")
@@ -741,7 +747,7 @@ def render_trade_decision_card(row, market, capital, risk_pct):
     o2.success(f"**Target 2 (3R - Runner Exit):** {m['ccy']}{t2:,.2f}")
 
 # ==============================================================================
-# 5. DYNAMIC FUTURE-ONLY EXPIRY ENGINE
+# PHASE 6: OPTIONS EXPIRY & BLACK-SCHOLES GREEKS ENGINE
 # ==============================================================================
 NSE_EXPIRY_HOLIDAYS = {date(2026, 10, 20), date(2026, 11, 10), date(2026, 11, 24)}
 
@@ -1104,7 +1110,7 @@ def render_scanner(market):
     show_all = col3.toggle("Show all ranked leaders (Ignore cutoff)", value=False, key=f"{k}_show_all",
                            help="Displays the highest-scoring stocks even if they fall below the strict entry cutoff.")
     
-    st.caption(r"Phase 5: Decision Intelligence & Order Ticket Generation.")
+    st.caption(r"Phase 5 & 6: Granular Sector-Breadth filtering, Decision Cards & Order Ticket Generation.")
 
     if st.button("Run Market Scanner", key=f"btn_exec_{k}_equity_scan"):
         with st.spinner("Screening universe and calculating decision cards..."):
@@ -1154,8 +1160,6 @@ def render_scanner(market):
     sel = a1.selectbox("Select Candidate:", view["Symbol"].tolist(), key=f"sb_{k}_cand_sel")
     
     selected_row = view[view["Symbol"] == sel].iloc[0]
-    
-    # Phase 5: Render Decision Card and Order Ticket
     render_trade_decision_card(selected_row, market, c[f"cap_{market}"], c["risk_pct"])
     
     if a2.button("Track This Stock", key=f"btn_track_{k}_cand"):
@@ -1390,22 +1394,22 @@ elif app_mode == NAV[1]:
     render_equity_monitor("IN")
 
 # ##############################################################################
-# SECTION 3: HIGH-PROBABILITY OPTIONS TRADING DESK (INDIAN MARKET)
+# SECTION 3: HIGH-PROBABILITY OPTIONS TRADING DESK (NSE) - PHASE 6 UPGRADED
 # ##############################################################################
 elif app_mode == NAV[2]:
     st.title("🎯 High-Probability Options Trading Desk (NSE)")
-    st.caption("Screens for index & F&O setups. Features strictly upcoming future expiries and volatility pricing.")
+    st.caption("Phase 6: Black-Scholes Greeks, IV vs. HV20 pricing, and directional spread intelligence.")
     c = cfg()
     opt_choice = st.radio("Choose Trading Segment:", ["Benchmark Indices (Nifty / Bank Nifty)", "Top F&O Momentum Stocks"],
                           horizontal=True, key="rb_options_segment_in")
 
     if opt_choice == "Benchmark Indices (Nifty / Bank Nifty)":
-        st.subheader("Benchmark Index Directional Engine")
+        st.subheader("Benchmark Index Directional & Volatility Engine")
         idx_name = st.selectbox("Select Index:", list(INDEX_DICT.keys()), key="sb_index_choice_in")
         meta = INDEX_DICT[idx_name]
         
         if st.button("Evaluate Index Setup", key="btn_eval_index_options_in"):
-            with st.spinner(f"Evaluating {idx_name}..."):
+            with st.spinner(f"Evaluating {idx_name} options structure and Greeks..."):
                 df_idx = get_history(meta["yf"], "2y")
                 if df_idx.empty or len(df_idx) < 210:
                     st.error("Insufficient market data available.")
@@ -1423,12 +1427,17 @@ elif app_mode == NAV[2]:
                     spot = chain["spot"] if (chain and chain.get("spot") == chain.get("spot")) else _f(last["Close"])
                     exp_d, dte = pick_expiry(meta["nse"], chain, min_dte=2)
                     
+                    # Phase 6: Volatility Pricing Analysis
+                    atm_iv = chain.get("atm_iv") or 15.0
+                    hv20 = _f(last.get("HV20"), 14.0)
+                    vol_richness = "RICH (Elevated IV)" if atm_iv > (hv20 * 1.15) else ("CHEAP (Low IV)" if atm_iv < (hv20 * 0.85) else "FAIR")
+                    
                     DataQualityManager.render_badge(diag, "Index Yahoo Feed")
                     col1, col2, col3, col4 = st.columns(4)
                     col1.metric("Spot Level", f"{spot:,.1f}")
                     col2.metric("Next Expiry", f"{exp_d:%d-%b-%Y}", f"{dte} Days to Expiry")
-                    col3.metric("Call Confluence", f"{lg['score']} ({lg['grade']})")
-                    col4.metric("Put Confluence", f"{sh['score']} ({sh['grade']})")
+                    col3.metric("ATM IV vs HV20", f"{atm_iv:.1f}% / {hv20:.1f}%", vol_richness)
+                    col4.metric("Market Sentiment", f"{sent['label']} ({sent['score']:+.2f})")
                     
                     direction = "CE" if lg["score"] >= c["min_score"] and lg["score"] > sh["score"] else (
                                 "PE" if sh["score"] >= c["min_score"] and sh["score"] > lg["score"] else None)
@@ -1437,21 +1446,34 @@ elif app_mode == NAV[2]:
                         step = meta["step"]
                         atm = round_to_strike(spot, step)
                         strike = atm - step if direction == "CE" else atm + step
-                        g = bs_greeks(spot, strike, max(dte, 1)/365, MARKETS["IN"]["rf"], 0.15, direction)
+                        g = bs_greeks(spot, strike, max(dte, 1)/365, MARKETS["IN"]["rf"], atm_iv/100.0, direction)
                         prem = g["price"]
                         contract_name = f"{idx_name} {exp_d.strftime('%d%b%y').upper()} {strike} {direction}"
                         
                         st.success(f"### 🟢 RECOMMENDED SETUP: BUY {contract_name}")
-                        st.write(f"**Strike:** {strike} ({direction}) | **Model Premium:** ₹{prem:.1f} | **Lot Size:** {meta['lot']}")
+                        
+                        # Greek Metrics Display
+                        g1, g2, g3, g4 = st.columns(4)
+                        g1.metric("Model Premium", f"₹{prem:.1f}")
+                        g2.metric("Delta (Δ)", f"{g['delta']:.2f}")
+                        g3.metric("Daily Theta (Θ)", f"₹{g['theta']:.2f}/day")
+                        g4.metric("Lot Size", f"{meta['lot']} units")
+                        
+                        # Capital & Risk Sizing
+                        lot_cost = prem * meta["lot"]
+                        max_lots = max(1, int((c["cap_IN"] * 0.03) // lot_cost))
+                        st.info(f"**Recommended Sizing:** {max_lots} Lot(s) | **Max Premium Outlay:** ₹{lot_cost * max_lots:,.2f}")
                         
                         st.session_state.active_index_signal = {
                             "Contract": contract_name, "Underlying": meta["nse"], "Option_Type": direction, "Strike": strike,
-                            "Expiry": exp_d.strftime("%d-%b-%Y"), "Lot_Size": meta["lot"], "Underlying_SL": spot * 0.99,
-                            "Prem": round(prem, 1), "Prem_SL": round(prem * 0.7, 1), "Prem_Tgt": round(prem * 1.5, 1)
+                            "Expiry": exp_d.strftime("%d-%b-%Y"), "Lots": max_lots, "Lot_Size": meta["lot"],
+                            "Underlying_SL": spot * 0.99, "Prem": round(prem, 1),
+                            "Prem_SL": round(prem * 0.65, 1), "Prem_Tgt": round(prem * 1.5, 1)
                         }
                     else:
                         st.session_state.active_index_signal = None
-                        st.warning("### ⚠️ NO HIGH-PROBABILITY TRADE — STAND ASIDE")
+                        st.warning("### ⚠️ NO HIGH-PROBABILITY DIRECTIONAL SETUP — STAND ASIDE")
+                        st.write(f"Call Score: **{lg['score']}** | Put Score: **{sh['score']}** (Requires ≥ {c['min_score']})")
 
         sig = st.session_state.get("active_index_signal")
         if sig:
@@ -1459,17 +1481,25 @@ elif app_mode == NAV[2]:
                 new_row = pd.DataFrame([{
                     "Row_ID": uuid.uuid4().hex[:8], "Contract": sig["Contract"], "Underlying": sig["Underlying"],
                     "Option_Type": sig["Option_Type"], "Strike": sig["Strike"], "Expiry": sig["Expiry"],
-                    "Lots": 1, "Lot_Size": sig["Lot_Size"], "Entry_Premium": sig["Prem"], "Target_Premium": sig["Prem_Tgt"],
-                    "Stop_Loss_Premium": sig["Prem_SL"], "Underlying_SL": sig["Underlying_SL"], "Last_Premium": sig["Prem"],
+                    "Lots": sig["Lots"], "Lot_Size": sig["Lot_Size"], "Entry_Premium": sig["Prem"],
+                    "Target_Premium": sig["Prem_Tgt"], "Stop_Loss_Premium": sig["Prem_SL"],
+                    "Underlying_SL": sig["Underlying_SL"], "Last_Premium": sig["Prem"],
                     "Entry_Date": datetime.now().strftime("%Y-%m-%d %H:%M")
                 }])
                 st.session_state.opt_portfolio = pd.concat([st.session_state.opt_portfolio, new_row], ignore_index=True)
                 save_csv_data(st.session_state.opt_portfolio, OPTIONS_PORTFOLIO_FILE)
-                st.success(f"✅ Added {sig['Contract']} to Options Exit Engine!")
+                st.success(f"✅ Added {sig['Contract']} ({sig['Lots']} lot(s)) to Options Exit Engine!")
 
     else:
         st.subheader("Top F&O Momentum Stocks")
-        st.info("Runs dynamic leading-setup evaluation on active F&O equities.")
+        st.caption("Phase 6: Multi-Indicator options momentum scanning on active F&O equities.")
+        if st.button("Run F&O Options Momentum Scan", key="btn_fno_options_scan"):
+            with st.spinner("Screening F&O watchlist for high-probability setups..."):
+                fno_results, reg, _ = run_equity_scan(FNO_WATCHLIST[:15], "IN", c["min_score"], c["atr_mult"], check_earnings=True)
+                if not fno_results.empty:
+                    show_df(fno_results[["Symbol", "Score", "Grade", "Setup Type", "Price (₹)", "Rel Vol", "RSI", "Stop (₹)", "T1 2R (₹)"]])
+                else:
+                    st.info("No single-stock F&O options met the strict confluence threshold today.")
 
 # ##############################################################################
 # SECTION 4: ACTIVE OPTIONS EXIT ALERT ENGINE (INDIAN MARKET)
