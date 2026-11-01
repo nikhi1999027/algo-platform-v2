@@ -31,6 +31,14 @@ Action: 1. Implemented flat-price protection in calculate_rsi() returning neutra
 Impact: Eliminates peak-chasing entries and prevents calculation anomalies.
 Dependencies: numpy, pandas.
 Tests: Validated on synthetic test suites and live historical feeds.
+------------------------------------------------------------
+[UPGRADE-004] Phase 4: Transparent Market Scanner & Leader Display
+Reason: In RISK-OFF regimes (-20 penalty), scanner completely hid the table
+        if all stocks fell below cutoff score (e.g., 65 or 55).
+Action: Added 'Show all ranked leaders (Ignore cutoff)' toggle and transparent
+        status callouts in render_scanner().
+Impact: Traders can view relative-strength leaders defying broader weakness.
+Dependencies: streamlit, pandas.
 ============================================================
 """
 import streamlit as st
@@ -48,7 +56,7 @@ import warnings
 from datetime import datetime, timedelta, date, timezone
 from zoneinfo import ZoneInfo
 
-# Suppress internal third-party library deprecation warnings from polluting console logs
+# Suppress internal third-party library deprecation warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*inplace keyword in DataFrame.*")
 
@@ -305,7 +313,7 @@ def projected_rel_volume(df, market):
     return vol / vol_avg, False
 
 # ==============================================================================
-# 2. TECHNICAL INDICATOR ENGINE
+# 2. TECHNICAL INDICATOR ENGINE (MATHEMATICAL INTEGRITY)
 # ==============================================================================
 def calculate_sma(series, window=20):
     return series.rolling(window=window).mean()
@@ -960,9 +968,12 @@ def render_scanner(market):
     m = MARKETS[market]
     c = cfg()
     k = market.lower()
-    col1, col2 = st.columns(2)
+    
+    col1, col2, col3 = st.columns([2, 1.5, 1.5])
     universe = col1.selectbox("Universe:", ["Nifty 100", "Top F&O Leaders"] if market == "IN" else ["Curated Leaders"], key=f"{k}_univ")
     chk_earn = col2.toggle("Screen for earnings gap risk", value=True, key=f"{k}_earn")
+    show_all = col3.toggle("Show all ranked leaders (Ignore cutoff)", value=False, key=f"{k}_show_all",
+                           help="Displays the highest-scoring stocks even if they fall below the strict entry cutoff.")
     
     st.caption(r"Filters for non-extended leading entries (Pullbacks to 20-EMA & Bollinger Squeezes). Flags setups that are >1.8x ATR overextended.")
 
@@ -970,26 +981,43 @@ def render_scanner(market):
         with st.spinner("Screening universe for leading confluence setups..."):
             syms = fetch_indian_tickers(universe) if market == "IN" else fetch_us_tickers()
             res, regime, skipped = run_equity_scan(syms, market, c["min_score"], c["atr_mult"], check_earnings=chk_earn)
-            st.session_state[f"scan_{k}"] = {"df": res, "regime": regime, "n": len(syms), "skipped": skipped,
-                                             "ts": datetime.now().strftime("%Y-%m-%d %H:%M")}
+            st.session_state[f"scan_{k}"] = {
+                "df": res, 
+                "regime": regime, 
+                "n": len(syms), 
+                "skipped": skipped,
+                "ts": datetime.now().strftime("%Y-%m-%d %H:%M")
+            }
 
     sc = st.session_state.get(f"scan_{k}")
     if not sc:
         return
+        
     regime_banner(sc["regime"], market)
     res = sc["df"]
     if res.empty:
         st.info("No data returned. Please try again.")
         return
-    view = res[res["Score"] >= c["min_score"]]
-    st.caption(f"Scanned {sc['n']} symbols at {sc['ts']}. {len(view)} at/above score {c['min_score']}.")
+
+    # View filtering logic
+    view = res if show_all else res[res["Score"] >= c["min_score"]]
+    st.caption(f"Scanned {sc['n']} symbols at {sc['ts']}. Showing {len(view)} candidate(s) (Cutoff score: {c['min_score']}).")
+    
     if view.empty:
-        st.info("No stocks met the strict low-risk entry criteria today. Standing aside protects capital.")
+        st.warning(
+            f"⚠️ No stocks met the strict low-risk entry criteria (Score ≥ {c['min_score']}) today due to {sc['regime']['label']} regime conditions.\n\n"
+            f"💡 **Tip:** Turn on **'Show all ranked leaders (Ignore cutoff)'** above to inspect which stocks have the highest relative strength."
+        )
         return
+
     show_df(view)
-    st.download_button("📥 Download Scanner Results CSV", data=view.to_csv(index=False).encode("utf-8"),
-                       file_name=f"{market}_Scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                       mime="text/csv", key=f"btn_dl_{k}_scan_csv")
+    st.download_button(
+        "📥 Download Scanner Results CSV", 
+        data=view.to_csv(index=False).encode("utf-8"),
+        file_name=f"{market}_Scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv", 
+        key=f"btn_dl_{k}_scan_csv"
+    )
 
     st.markdown("---")
     st.markdown("#### **⚡ Add Candidate to Active Exit Engine**")
@@ -1001,10 +1029,17 @@ def render_scanner(market):
         stop = float(row[f"Stop ({m['ccy']})"])
         qty = position_size(c[f"cap_{market}"], c["risk_pct"], entry, stop)
         new_entry = pd.DataFrame([{
-            "Row_ID": uuid.uuid4().hex[:8], "Symbol": sel, "Entry_Price": entry,
-            "Target_Price": float(row[f"T1 2R ({m['ccy']})"]), "Stop_Loss": stop,
-            "Entry_Date": datetime.now().strftime("%Y-%m-%d %H:%M"), "Qty": qty,
-            "Initial_Stop": stop, "ATR_Entry": float(row["ATR"]), "Setup": row["Setup Type"]}])
+            "Row_ID": uuid.uuid4().hex[:8], 
+            "Symbol": sel, 
+            "Entry_Price": entry,
+            "Target_Price": float(row[f"T1 2R ({m['ccy']})"]), 
+            "Stop_Loss": stop,
+            "Entry_Date": datetime.now().strftime("%Y-%m-%d %H:%M"), 
+            "Qty": qty,
+            "Initial_Stop": stop, 
+            "ATR_Entry": float(row["ATR"]), 
+            "Setup": row["Setup Type"]
+        }])
         key, fpath = PORTFOLIO_KEYS[market]
         st.session_state[key] = pd.concat([st.session_state[key], new_entry], ignore_index=True)
         save_csv_data(st.session_state[key], fpath)
@@ -1320,7 +1355,7 @@ elif app_mode == NAV[3]:
 
 # ##############################################################################
 # SECTION 5: MARKET REGIME, INSTITUTIONAL FII/DII & SENTIMENT
-# ##############################################################################
+# #################################################################=============
 elif app_mode == NAV[4]:
     st.title("🏛️ Market Regime, Institutional Activity & Sentiment")
     for mk in ("IN", "US"):
@@ -1333,9 +1368,9 @@ elif app_mode == NAV[4]:
         st.caption(f"Source: {src}")
         show_df(fii_data)
 
-# ##############################################################################
+# #################################################################=============
 # SECTION 6: US EQUITIES SWING TRADING DESK
-# ##############################################################################
+# #################################################################=============
 elif app_mode == NAV[5]:
     st.title("🗽 US Equities Multi-Indicator Swing Desk")
     us_tab_scan, us_tab_single, us_tab_sz = st.tabs(["🚀 US Market Scanner", "🔍 US Stock Deep Dive", "🧮 Position Sizer"])
