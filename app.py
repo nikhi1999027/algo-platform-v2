@@ -75,6 +75,8 @@ Impact: Eliminates emotional exits and provides quantitative post-trade performa
 Dependencies: streamlit, pandas, numpy.
 ------------------------------------------------------------
 [FIX-01..12] Index-options strategy engine, exit engine and bug fixes — see CHANGELOG_FIX.md
+[ORDER-FIX] Re-ordered run_equity_scan() and render_scanner() before navigation router
+            to permanently resolve runtime NameError.
 ============================================================
 """
 import streamlit as st
@@ -113,7 +115,7 @@ EQ_COLS = ["Row_ID", "Symbol", "Entry_Price", "Target_Price", "Stop_Loss", "Entr
            "Qty", "Initial_Stop", "ATR_Entry", "Setup"]
 OPT_COLS = ["Row_ID", "Contract", "Underlying", "Option_Type", "Strike", "Expiry", "Lots", "Lot_Size",
             "Entry_Premium", "Target_Premium", "Stop_Loss_Premium", "Underlying_SL", "Last_Premium", "Entry_Date",
-            "Strategy", "Side", "Legs", "Underlying_SL2"]  # [FIX-06] multi-leg / credit structures
+            "Strategy", "Side", "Legs", "Underlying_SL2"]
 JOURNAL_COLS = ["Market", "Instrument", "Direction", "Entry", "Exit", "Qty", "PnL", "PnL_Pct",
                 "R_Multiple", "Entry_Date", "Exit_Date", "Exit_Reason", "Setup"]
 
@@ -193,8 +195,7 @@ def _f(x, default=np.nan):
 class DataQualityManager:
     @staticmethod
     def inspect_dataframe(df, market="IN"):
-        """[FIX-10] Daily bars are stamped at midnight, so 'hours since bar' always read DELAYED.
-        Judge freshness by trading sessions instead."""
+        """[FIX-10] Judge freshness by trading sessions instead of absolute hours."""
         if df is None or df.empty:
             return {"status": "UNAVAILABLE", "badge": "🔴 UNAVAILABLE", "last_bar": "Never", "is_stale": True}
         last_d = pd.Timestamp(df.index[-1]).date()
@@ -606,7 +607,7 @@ def score_setup(r, symbol="", direction="long", rs_rating=None, regime="NEUTRAL"
     elif breakout:
         setup, spts = "Fresh Pivot Breakout", 7
     else:
-        trend_ok = (c > e20 > e50) if L else (c < e20 < e50)  # [FIX-07] no points for 'continuation' without a trend
+        trend_ok = (c > e20 > e50) if L else (c < e20 < e50)
         setup, spts = ("Trend Continuation", 3) if trend_ok else ("No Setup", 0)
 
     mx += 10
@@ -648,7 +649,7 @@ def score_setup(r, symbol="", direction="long", rs_rating=None, regime="NEUTRAL"
             score -= 20
             flags.append("Market in RISK-OFF (High breakout failure rate)")
 
-    # [FIX-07] sentiment penalty integration
+    # News sentiment penalty integration
     if sentiment is not None and ((L and sentiment <= -0.3) or ((not L) and sentiment >= 0.3)):
         score -= 5
         flags.append("News sentiment against the trade")
@@ -749,12 +750,239 @@ def render_trade_decision_card(row, market, capital, risk_pct):
     o2.success(f"**Target 2 (3R - Runner Exit):** {m['ccy']}{t2:,.2f}")
 
 # ==============================================================================
+# SCANNER LOGIC (ORDERED PROPERLY BEFORE NAVIGATION SECTIONS)
+# ==============================================================================
+def cfg():
+    return st.session_state.get("_cfg", {"min_score": 65, "atr_mult": 1.8, "risk_pct": 1.0,
+                                         "cap_IN": 500000.0, "cap_US": 10000.0, "nse_live": True})
+
+def regime_banner(regime, market):
+    lab = regime["label"]
+    vix_txt = f" | VIX {regime['vix']:.1f} ({regime['vix_pct'] * 100:.0f}th pct, 1y)" if regime.get("vix") else ""
+    msg = f"**Market regime: {lab}** — {regime['details']}{vix_txt}"
+    if lab == "RISK-ON":
+        st.success(msg)
+    elif lab == "NEUTRAL":
+        st.warning(msg + " — reduce size, be selective.")
+    else:
+        st.error(msg + " — high breakout failure rate; prioritize cash or strict pullback entries.")
+
+def run_equity_scan(symbols, market, min_score, atr_mult, direction="long", check_earnings=True):
+    m = MARKETS[market]
+    yf_syms = [f"{s}{m['suffix']}" for s in symbols]
+    data = download_many(tuple(yf_syms), "2y")
+    regime = get_market_regime(market)
+    sector_health = get_sector_regimes() if market == "IN" else {}
+    feats, skipped = {}, 0
+    for s, t in zip(symbols, yf_syms):
+        df = data.get(t)
+        if df is None or len(df) < 210:
+            skipped += 1
+            continue
+        ind = add_indicators(df)
+        last = ind.iloc[-1]
+        if _f(last["TradedValue20"], 0) < m["min_value"]:
+            continue
+        feats[s] = (ind, df)
+    if not feats:
+        return pd.DataFrame(), regime, skipped
+    raw = pd.Series({s: rs_raw_score(v[0]["Close"]) for s, v in feats.items()})
+    rs_rating = (raw.rank(pct=True) * 98 + 1).round(0)
+    rows = []
+    for s, (ind, df) in feats.items():
+        last = ind.iloc[-1]
+        rv, projected = projected_rel_volume(df, market)
+        res = score_setup(last, symbol=s, direction=direction, rs_rating=float(rs_rating[s]),
+                          regime=regime["label"], sector_health=sector_health, relvol=rv)
+        lv = compute_levels(last, direction, atr_mult)
+        rows.append({
+            "Symbol": s, "Sector": res["sector"], "Score": res["score"], "Grade": res["grade"], "Setup Type": res["setup"],
+            f"Price ({m['ccy']})": round(_f(last["Close"]), 2), "RS Rating": int(rs_rating[s]),
+            "Rel Vol": f"{rv:.2f}x{' (proj)' if projected else ''}" if rv == rv else "n/a",
+            "RSI": round(_f(last["RSI"]), 1), "ADX": round(_f(last["ADX"]), 1), "ATR %": round(_f(last["ATR_Pct"]), 2),
+            f"Stop ({m['ccy']})": lv["stop"], "Risk %": lv["risk_pct"],
+            f"T1 2R ({m['ccy']})": lv["t1"], f"T2 3R ({m['ccy']})": lv["t2"],
+            "ATR": round(_f(last["ATR"]), 2), "Flags": "; ".join(res["flags"]), "Why": "; ".join(res["why"]),
+        })
+    out = pd.DataFrame(rows).sort_values("Score", ascending=False).reset_index(drop=True)
+    if check_earnings and not out.empty:
+        top = out[out["Score"] >= min_score - 10].head(20).index
+        for i in top:
+            sym = out.at[i, "Symbol"]
+            ed = get_next_earnings(f"{sym}{m['suffix']}")
+            dd = days_until(ed)
+            if dd is not None and 0 <= dd <= 7:
+                out.at[i, "Score"] = max(0.0, out.at[i, "Score"] - 10)
+                out.at[i, "Flags"] = (out.at[i, "Flags"] + "; " if out.at[i, "Flags"] else "") + f"Earnings {ed} — gap risk"
+        out = out.sort_values("Score", ascending=False).reset_index(drop=True)
+    out["Grade"] = out["Score"].apply(lambda x: "A+" if x >= 85 else "A" if x >= 75 else "B" if x >= 65 else "C")
+    return out, regime, skipped
+
+def render_scanner(market):
+    m = MARKETS[market]
+    c = cfg()
+    k = market.lower()
+    
+    col1, col2, col3 = st.columns([2, 1.5, 1.5])
+    universe = col1.selectbox("Universe:", ["Nifty 100", "Top F&O Leaders"] if market == "IN" else ["Curated Leaders"], key=f"{k}_univ")
+    chk_earn = col2.toggle("Screen for earnings gap risk", value=True, key=f"{k}_earn")
+    show_all = col3.toggle("Show all ranked leaders (Ignore cutoff)", value=False, key=f"{k}_show_all",
+                           help="Displays the highest-scoring stocks even if they fall below the strict entry cutoff.")
+    
+    st.caption(r"Filters for non-extended leading entries (Pullbacks to 20-EMA & Bollinger Squeezes). Flags setups that are >1.8x ATR overextended.")
+
+    if st.button("Run Market Scanner", key=f"btn_exec_{k}_equity_scan"):
+        with st.spinner("Screening universe and calculating decision cards..."):
+            syms = fetch_indian_tickers(universe) if market == "IN" else fetch_us_tickers()
+            res, regime, skipped = run_equity_scan(syms, market, c["min_score"], c["atr_mult"], check_earnings=chk_earn)
+            st.session_state[f"scan_{k}"] = {
+                "df": res, 
+                "regime": regime, 
+                "n": len(syms), 
+                "skipped": skipped,
+                "ts": datetime.now().strftime("%Y-%m-%d %H:%M")
+            }
+
+    sc = st.session_state.get(f"scan_{k}")
+    if not sc:
+        return
+        
+    regime_banner(sc["regime"], market)
+    res = sc["df"]
+    if res.empty:
+        st.info("No data returned. Please try again.")
+        return
+
+    # View filtering logic
+    view = res if show_all else res[res["Score"] >= c["min_score"]]
+    st.caption(f"Scanned {sc['n']} symbols at {sc['ts']}. Showing {len(view)} candidate(s) (Cutoff score: {c['min_score']}).")
+    
+    if view.empty:
+        st.warning(
+            f"⚠️ No stocks met the strict low-risk entry criteria (Score ≥ {c['min_score']}) today due to {sc['regime']['label']} regime conditions.\n\n"
+            f"💡 **Tip:** Turn on **'Show all ranked leaders (Ignore cutoff)'** above to inspect which stocks have the highest relative strength."
+        )
+        return
+
+    show_df(view)
+    st.download_button(
+        "📥 Download Scanner Results CSV", 
+        data=view.to_csv(index=False).encode("utf-8"),
+        file_name=f"{market}_Scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv", 
+        key=f"btn_dl_{k}_scan_csv"
+    )
+
+    st.markdown("---")
+    st.markdown("#### **⚡ Select Stock for Institutional Decision Card & Order Ticket**")
+    a1, a2 = st.columns([3, 1])
+    sel = a1.selectbox("Select Candidate:", view["Symbol"].tolist(), key=f"sb_{k}_cand_sel")
+    
+    selected_row = view[view["Symbol"] == sel].iloc[0]
+    render_trade_decision_card(selected_row, market, c[f"cap_{market}"], c["risk_pct"])
+    
+    if a2.button("Track This Stock", key=f"btn_track_{k}_cand"):
+        entry = float(selected_row[f"Price ({m['ccy']})"])
+        stop = float(selected_row[f"Stop ({m['ccy']})"])
+        qty = position_size(c[f"cap_{market}"], c["risk_pct"], entry, stop)
+        new_entry = pd.DataFrame([{
+            "Row_ID": uuid.uuid4().hex[:8], 
+            "Symbol": sel, 
+            "Entry_Price": entry,
+            "Target_Price": float(selected_row[f"T1 2R ({m['ccy']})"]), 
+            "Stop_Loss": stop,
+            "Entry_Date": datetime.now().strftime("%Y-%m-%d %H:%M"), 
+            "Qty": qty,
+            "Initial_Stop": stop, 
+            "ATR_Entry": float(selected_row["ATR"]), 
+            "Setup": selected_row["Setup Type"]
+        }])
+        key, fpath = PORTFOLIO_KEYS[market]
+        st.session_state[key] = pd.concat([st.session_state[key], new_entry], ignore_index=True)
+        save_csv_data(st.session_state[key], fpath)
+        st.success(f"✅ Added {sel} to Active Monitor!")
+
+def render_deep_dive(market):
+    m = MARKETS[market]
+    k = market.lower()
+    c = cfg()
+    default = "RELIANCE" if market == "IN" else "NVDA"
+    sym = st.text_input("Enter Symbol:", value=default, key=f"ti_{k}_single").upper().strip()
+    sym = SYMBOL_RENAMES.get(sym, sym)
+    if not st.button("Analyze Stock", key=f"btn_{k}_single_eval"):
+        return
+    with st.spinner("Analyzing..."):
+        df = get_history(f"{sym}{m['suffix']}", "2y")
+        if df.empty or len(df) < 60:
+            st.error("No historical market data found.")
+            return
+        
+        diag = DataQualityManager.inspect_dataframe(df, market)
+        ind = add_indicators(df)
+        last = ind.iloc[-1]
+        regime = get_market_regime(market)
+        sector_health = get_sector_regimes() if market == "IN" else {}
+        excess = None
+        if regime["bench_close"] is not None and len(ind) > 64:
+            b = regime["bench_close"].reindex(ind.index, method="ffill")
+            excess = (float(ind["Close"].iloc[-1] / ind["Close"].iloc[-64]) - float(b.iloc[-1] / b.iloc[-64])) * 100
+        rs = rs_proxy_rating(excess)
+        sent = fetch_live_news_sentiment(sym, market=market)
+        ed = get_next_earnings(f"{sym}{m['suffix']}")
+        rv, proj = projected_rel_volume(df, market)
+        res = score_setup(last, symbol=sym, direction="long", rs_rating=rs, regime=regime["label"],
+                          sector_health=sector_health, relvol=rv, sentiment=sent["score"], earnings_days=days_until(ed))
+        lv = compute_levels(last, "long", c["atr_mult"])
+
+    regime_banner(regime, market)
+    DataQualityManager.render_badge(diag, "Yahoo Finance (Official)")
+    
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Current Price", f"{m['ccy']}{_f(last['Close']):,.2f}")
+    c2.metric("Confluence Score", f"{res['score']} ({res['grade']})")
+    c3.metric("Wilder's RSI (14)", round(_f(last["RSI"]), 1))
+    c4.metric("Sector", res["sector"])
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("Dynamic Stop", f"{m['ccy']}{lv['stop']:,.2f}", f"-{lv['risk_pct']}%")
+    d2.metric("Target (2R)", f"{lv['t1']:,.2f}")
+    d3.metric("Rel. Volume", f"{rv:.2f}x" if rv == rv else "n/a")
+    d4.metric("Sentiment", f"{sent['label']} ({sent['score']:+.2f})")
+    
+    if res["why"]:
+        st.markdown("**Bullish Signals Present:** " + " · ".join(res["why"]))
+    if res["flags"]:
+        st.warning("**Risk Flags:** " + " · ".join(res["flags"]))
+    st.line_chart(ind[["Close", "EMA_20", "EMA_50"]].tail(200).dropna())
+
+def render_sizer(market):
+    m = MARKETS[market]
+    k = market.lower()
+    c = cfg()
+    st.subheader("Position Size & Risk Calculator")
+    s1, s2, s3 = st.columns(3)
+    cap = s1.number_input(f"Total Capital ({m['ccy']}):", value=float(c[f"cap_{market}"]), step=10000.0, key=f"sz_cap_{k}")
+    risk = s2.number_input("Max Risk Per Trade (%):", value=float(c["risk_pct"]), step=0.25, key=f"sz_risk_{k}")
+    entry = s3.number_input(f"Entry Price ({m['ccy']}):", value=2500.0 if market == "IN" else 150.0, step=1.0, key=f"sz_entry_{k}")
+    s4, s5 = st.columns(2)
+    sl = s4.number_input(f"Stop Loss ({m['ccy']}):", value=2450.0 if market == "IN" else 145.0, step=1.0, key=f"sz_sl_{k}")
+    tgt = s5.number_input(f"Target Price ({m['ccy']}):", value=2600.0 if market == "IN" else 160.0, step=1.0, key=f"sz_tgt_{k}")
+    if st.button("Calculate Position", key=f"btn_calc_position_{k}"):
+        risk_per_unit = entry - sl
+        if risk_per_unit <= 0:
+            st.error("Entry price must be higher than Stop Loss.")
+        else:
+            qty = position_size(cap, risk, entry, sl)
+            rr = (tgt - entry) / risk_per_unit
+            st.success(f"**Recommended Buy Quantity:** {qty} shares | **Reward:Risk:** {rr:.2f}R")
+            st.write(f"**Capital Required:** {m['ccy']}{qty * entry:,.2f}")
+            st.write(f"**Max Loss at Stop:** :red[-{m['ccy']}{qty * risk_per_unit:,.2f}]")
+
+# ==============================================================================
 # [FIX-01..05] PRO INDEX-OPTIONS STRATEGY ENGINE
 # ==============================================================================
 def ist_today():
     """[FIX-12] Streamlit Cloud runs on UTC; expiry maths must use the IST calendar date."""
     return datetime.now(ZoneInfo("Asia/Kolkata")).date()
-
 
 def score_index_setup(r, direction="long", regime="NEUTRAL", sentiment=None):
     """[FIX-01] Index confluence score (0-100). No 52-week / relative-strength / volume rules."""
@@ -773,7 +1001,7 @@ def score_index_setup(r, direction="long", regime="NEUTRAL", sentiment=None):
     atr = _f(r["ATR"], 0.0) or max(c * 0.01, 1e-6)
     rsi, adx = _f(r["RSI"], 50), _f(r["ADX"], 0)
     pdi, mdi = _f(r["PDI"], 0), _f(r["MDI"], 0)
-    macd, sig, hist = _f(r["MACD"], 0), _f(r["Signal"], 0), _f(r["Hist"], 0)
+    macd, sig, hist = _f(r["Hist"], 0), _f(r["MACD"], 0), _f(r["Signal"], 0)
     hist_prev = _f(r.get("Hist_Prev", np.nan), hist)
 
     # Trend (35)
@@ -843,13 +1071,11 @@ def score_index_setup(r, direction="long", regime="NEUTRAL", sentiment=None):
     grade = "A+" if score >= 85 else "A" if score >= 75 else "B" if score >= 65 else "C"
     return {"score": round(score, 1), "grade": grade, "setup": setup, "why": why, "flags": flags, "ext": ext}
 
-
 def _prob_above(S, K, T, sigma, r=0.0):
     """Risk-neutral probability that the index expires above K."""
     T, sigma = max(T, 1 / 365), max(sigma, 0.01)
     d2 = (math.log(S / K) + (r - 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
     return _ncdf(d2)
-
 
 def _leg_price(chain, strike, typ, S, T, r, iv_pct):
     if chain is not None:
@@ -860,10 +1086,8 @@ def _leg_price(chain, strike, typ, S, T, r, iv_pct):
                 return round(v, 2), "live"
     return round(bs_greeks(S, strike, T, r, iv_pct / 100.0, typ)["price"], 2), "model"
 
-
 def legs_to_str(legs):
     return "|".join(f"{l['side']}:{int(l['strike'])}:{l['type']}" for l in legs)
-
 
 def parse_legs(s):
     out = []
@@ -875,12 +1099,10 @@ def parse_legs(s):
                 out.append({"side": bits[0], "strike": k, "type": bits[2]})
     return out
 
-
 def net_from_prices(legs, prices, side):
     """Net value of a structure: debit side = cost to own; credit side = cost to buy back."""
     raw = sum((p if l["side"] == "B" else -p) for l, p in zip(legs, prices))
     return raw if side == "DEBIT" else -raw
-
 
 def finalize_plan(plan, net, capital, risk_pct):
     """[FIX-05] Single source of truth for stop/target/size from actual net premium."""
@@ -905,7 +1127,6 @@ def finalize_plan(plan, net, capital, risk_pct):
             "one_lot_risk_pct": round(per_lot / capital * 100, 2) if capital else None,
             "rr": round(reward_u / plan_loss_u, 2) if plan_loss_u > 0 else 0.0}
 
-
 def _index_iv(meta, chain, regime, hv):
     if chain and chain.get("atm_iv"):
         return float(chain["atm_iv"]), "NSE ATM IV"
@@ -913,7 +1134,6 @@ def _index_iv(meta, chain, regime, hv):
         return float(regime["vix"]), "India VIX"
     base = hv * 1.1 if hv == hv and hv > 0 else 15.0
     return float(base), "HV20 × 1.1 proxy"
-
 
 def _directional_plan(plan, dirn, entry_spot, last, meta, iv, iv_rich, chain_e, dte, c, event_risk):
     rf, step = MARKETS["IN"]["rf"], meta["step"]
@@ -950,7 +1170,6 @@ def _directional_plan(plan, dirn, entry_spot, last, meta, iv, iv_rich, chain_e, 
                  "Exit by 1 day to expiry regardless."]
     else:
         p, s = _leg_price(chain_e, k_itm, dirn, entry_spot, T, rf, iv)
-        legs = [{"side": "B", "strike": k_itm, "type": dirn, "price": p, "src": s}]
         net = p
         prem_sl = max(p - abs(g["delta"]) * abs(entry_spot - lv["stop"]), 0.5 * p)
         prem_tgt = p + abs(g["delta"]) * t1_move - abs(g["theta"]) * min(2, dte)
@@ -966,7 +1185,6 @@ def _directional_plan(plan, dirn, entry_spot, last, meta, iv, iv_rich, chain_e, 
     plan.update({"dirn": dirn, "legs": legs, "net": net, "side": "DEBIT", "und_stop": lv["stop"], "und_stop2": None,
                  "t1_spot": round(t1_spot, 1), "em": round(em, 1), "theta_pct": round(theta_pct, 2), "exits": exits})
     return plan
-
 
 def _condor_plan(plan, spot, meta, iv, chain_e, dte):
     rf, step = MARKETS["IN"]["rf"], meta["step"]
@@ -1002,7 +1220,6 @@ def _condor_plan(plan, spot, meta, iv, chain_e, dte):
                            "Stop when the condor costs 2× the credit to close, or if spot trades through a short strike.",
                            "Exit by 1 day to expiry — never hold short options into expiry-day gamma."]})
     return plan
-
 
 def build_index_plan(idx_name, meta, ind, regime, chain0, sentiment, c, event_risk):
     """[FIX-02] Returns DIRECTIONAL / RANGE / WAIT / STAND ASIDE with a trade ticket."""
@@ -1068,7 +1285,6 @@ def build_index_plan(idx_name, meta, ind, regime, chain0, sentiment, c, event_ri
     if plan.get("legs"):
         plan.update(finalize_plan(plan, plan["net"], c["cap_IN"], c["risk_pct"]))
     return plan
-
 
 def render_index_plan(plan, c):
     """[FIX-03] Displays strategy decision, full execution ticket, and dual-direction scoring."""
@@ -1140,7 +1356,6 @@ def render_index_plan(plan, c):
             if rr["flags"]:
                 st.markdown("Penalties: " + " · ".join(rr["flags"]))
         st.caption(f"Threshold for a directional trade: {plan['thr']} (sidebar).")
-
 
 def evaluate_option_position(row, use_live=True):
     """[FIX-06] Exit engine for single options, debit spreads and iron condors."""
@@ -1229,6 +1444,113 @@ def evaluate_option_position(row, use_live=True):
             "Und. stop": und_sl if und_sl == und_sl else None, "Und. stop 2": und_sl2 if und_sl2 == und_sl2 else None,
             "Exit Signal": status}
 
+# ==============================================================================
+# PHASE 7: PORTFOLIO LIFECYCLE & DYNAMIC EXIT ENGINE
+# ==============================================================================
+def evaluate_equity_position(row, market):
+    """Phase 7: Multi-Stage Exit Engine with Breakeven Shift and Chandelier Trailing."""
+    m = MARKETS[market]
+    sym = str(row["Symbol"])
+    df = get_history(f"{sym}{m['suffix']}", "2y")
+    if df.empty or len(df) < 60:
+        return None
+    ind = add_indicators(df)
+    last = ind.iloc[-1]
+    cur, atr, e20 = _f(last["Close"]), _f(last["ATR"]), _f(last["EMA_20"])
+    entry, target, sl = _f(row["Entry_Price"]), _f(row["Target_Price"]), _f(row["Stop_Loss"])
+    init_stop = _f(row.get("Initial_Stop"), sl)
+    R = entry - init_stop if entry - init_stop > 0 else (entry * 0.02)
+    
+    edt = pd.to_datetime(row.get("Entry_Date"), errors="coerce")
+    since = ind[ind.index >= edt.normalize()] if pd.notna(edt) else ind.tail(1)
+    if since.empty:
+        since = ind.tail(1)
+    hh = float(since["High"].max())
+    
+    # State Machine Trailing Logic
+    trail = max(init_stop, sl)
+    lifecycle_state = "HOLD"
+    
+    if hh >= entry + R:
+        trail = max(trail, entry)
+        lifecycle_state = "BREAKEVEN PROTECTED"
+    
+    if hh >= target:
+        chandelier = hh - 2.5 * atr
+        trail = max(trail, chandelier)
+        lifecycle_state = "TRAILING (CHANDELIER)"
+        
+    days = (datetime.now() - edt.to_pydatetime()).days if pd.notna(edt) else 0
+    if cur <= trail:
+        action = "🛑 STOP HIT — Exit Position Immediately"
+        lifecycle_state = "EXIT TRIGGERED"
+    elif cur >= target and lifecycle_state != "TRAILING (CHANDELIER)":
+        action = "🎯 TARGET 1 HIT — Scale 50%, Trail Remainder"
+    elif cur < e20 and _f(last["MACD"]) < _f(last["Signal"]):
+        action = "⚠️ CAUTION — Closed Below EMA20 with MACD cross"
+    else:
+        action = "✅ ACTIVE — Position in Structural Health"
+
+    qty = _f(row.get("Qty"), 0)
+    pnl = (cur - entry) * qty
+    pnl_pct = (cur / entry - 1) * 100
+    r_mult = (cur - entry) / R if R > 0 else 0.0
+
+    return {
+        "Row_ID": row["Row_ID"], "Symbol": sym, "State": lifecycle_state,
+        f"Entry ({m['ccy']})": round(entry, 2), f"Live ({m['ccy']})": round(cur, 2),
+        f"Active Stop ({m['ccy']})": round(trail, 2), "P&L %": round(pnl_pct, 2),
+        "P&L": round(pnl, 2), "Current R": round(r_mult, 2), "Days Held": days, "Exit Signal": action
+    }
+
+def render_equity_monitor(market):
+    m = MARKETS[market]
+    k = market.lower()
+    key, fpath = PORTFOLIO_KEYS[market]
+    port_df = st.session_state[key]
+
+    if port_df.empty:
+        st.info("No active trades currently in portfolio.")
+        return
+        
+    st.subheader(f"Active Portfolio Exit Engine ({market})")
+    rows = []
+    with st.spinner("Evaluating live positions through Phase 7 Lifecycle Machine..."):
+        for _, row in port_df.iterrows():
+            try:
+                r = evaluate_equity_position(row, market)
+                if r:
+                    rows.append(r)
+            except Exception:
+                continue
+    live = pd.DataFrame(rows)
+    if not live.empty:
+        tot_unrealised = live["P&L"].sum()
+        p1, p2, p3 = st.columns(3)
+        p1.metric("Open Positions", len(live))
+        p2.metric("Total Unrealized P&L", f"{m['ccy']}{tot_unrealised:,.2f}")
+        p3.metric("Avg R-Multiple", f"{live['Current R'].mean():.2f}R")
+        show_df(live.drop(columns=["Row_ID"]))
+
+    st.markdown("---")
+    st.markdown("#### **⚡ Close Position & Send to Performance Journal**")
+    labels = {r["Row_ID"]: f"{r['Symbol']} | Entry {r['Entry_Price']} | {r['Row_ID']}" for _, r in port_df.iterrows()}
+    rid = st.selectbox("Select Trade to Settle:", list(labels.keys()), format_func=lambda x: labels[x], key=f"sb_close_{k}")
+    sel = port_df[port_df["Row_ID"] == rid].iloc[0]
+    live_px = float(live.loc[live["Row_ID"] == rid, f"Live ({m['ccy']})"].iloc[0]) if (not live.empty and (live["Row_ID"] == rid).any()) else _f(sel["Entry_Price"])
+    
+    col_x, col_y = st.columns(2)
+    exit_px = col_x.number_input(f"Execution Exit Price ({m['ccy']}):", value=float(live_px), key=f"ni_exit_{k}_{rid}")
+    reason = col_y.selectbox("Exit Reason:", ["Target Hit (2R)", "Trailing Stop Hit", "Stop Loss Hit", "Discretionary / Time Stop"], key=f"sb_reason_{k}")
+    
+    if st.button("Close Trade & Save to Journal", key=f"btn_close_log_{k}"):
+        init_r = abs(_f(sel["Entry_Price"]) - _f(sel.get("Initial_Stop"), _f(sel["Stop_Loss"])))
+        init_r = init_r if init_r == init_r and init_r > 0 else None
+        log_to_journal(market, sel["Symbol"], "LONG", sel["Entry_Price"], exit_px, _f(sel.get("Qty"), 0), sel["Entry_Date"], reason, str(sel.get("Setup") or ""), init_risk=init_r)
+        st.session_state[key] = port_df[port_df["Row_ID"] != rid].reset_index(drop=True)
+        save_csv_data(st.session_state[key], fpath)
+        st.success("Trade closed and journaled!")
+        st.rerun()
 
 # ==============================================================================
 # SIDEBAR NAVIGATION & GLOBALLY SCOPED SETTINGS
@@ -1521,7 +1843,7 @@ elif app_mode == NAV[7]:
     if j.empty:
         st.info("No closed trades logged yet. Settle an open trade from Desk 2 or Desk 7 to inspect analytics.")
     else:
-        # [FIX-09] Scorecard per market — rupee and dollar P&L were previously added together.
+        # [FIX-09] Scorecard per market — rupee and dollar P&L separated
         j["PnL"] = pd.to_numeric(j["PnL"], errors="coerce").fillna(0.0)
         j["R_Multiple"] = pd.to_numeric(j["R_Multiple"], errors="coerce")
         st.subheader("Performance Scorecard (per market)")
