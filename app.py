@@ -3,80 +3,36 @@
 AI CODE REVIEW AND UPGRADE LOG
 ============================================================
 [UPGRADE-001] Phase 2: Data Quality, Freshness Engine & Diagnostics
-Reason: Stale data was not clearly distinguished from live/delayed feeds;
-        users could not verify data latency or source health.
-Action: Implemented DataQualityManager to evaluate bar recency, added
-        visual freshness badges across all desks, and suppressed third-party
-        deprecation log noise.
-Impact: Guarantees transparency. Prevents false signals on stale candles.
-Dependencies: None (Standard library + existing requirements).
-Tests: Verified freshness against live market hours (IST and EST).
+Reason: Stale data was not clearly distinguished from live/delayed feeds.
+Action: Implemented DataQualityManager to evaluate bar recency.
 ------------------------------------------------------------
 [UPGRADE-002] News Sentiment Scraper URL Variable Fix
-Reason: Variable 'encoded' was referenced before assignment in US/IN
-        branches, triggering a potential NameError.
+Reason: Variable 'encoded' was referenced before assignment in US/IN branches.
 Action: Standardized URL encoding variable 'q' across both branches.
-Impact: Eliminates news scraper crashes and ensures valid polarity scoring.
-Dependencies: feedparser, vaderSentiment.
-Tests: Validated query extraction for NSE and US tickers.
 ------------------------------------------------------------
-[UPGRADE-003] Phase 3: Mathematical Integrity, Multi-Timeframe Confirmation & Leading Setups
-Reason: Prior momentum crossovers chased tops. Flat price series caused division-by-zero
-        in RSI, producing 0.0 instead of neutral 50.0.
-Action: 1. Implemented flat-price protection in calculate_rsi() returning neutral 50.0.
-        2. Validated Wilder's smoothing for ATR and ADX.
-        3. Built leading entry classifier: Pullback-to-EMA20 and Bollinger Squeeze (<18th percentile).
-        4. Enforced strict 1.8x ATR overextension penalty.
-        5. Added weekly trend multi-timeframe filter (Weekly Close > EMA10 + MACD Hist > 0).
-Impact: Eliminates peak-chasing entries and prevents calculation anomalies.
-Dependencies: numpy, pandas.
-Tests: Validated on synthetic test suites and live historical feeds.
+[UPGRADE-003] Phase 3: Mathematical Integrity & Leading Setups
+Reason: Prior momentum crossovers chased tops; flat series caused RSI division-by-zero.
+Action: Safe flat RSI (50.0), Wilder smoothing for ATR/ADX, EMA20 Pullback, Bollinger Squeeze.
 ------------------------------------------------------------
 [UPGRADE-004] Phase 4: Sector Breadth, Granular Regimes & Event-Risk Intelligence
-Reason: Blanket -20 penalty in RISK-OFF suppressed leading stocks whose individual
-        sectors were rallying independently (e.g. Pharma or Banking).
-Action: 1. Built STOCK_SECTOR_MAP and SECTOR_INDICES for major Indian sectors.
-        2. Added get_sector_regimes() to evaluate 50-SMA health across sectors.
-        3. Updated score_setup() to waive the -20 penalty down to -5 if the stock's
-           sector is BULLISH.
-        4. Enhanced event-risk detection for upcoming corporate earnings.
-Impact: Distinguishes resilient sector leaders from macro breakdowns.
-Dependencies: yfinance, pandas, numpy.
-Tests: Validated against current market regime and sectoral index feeds.
+Reason: Blanket -20 penalty in RISK-OFF suppressed leading stocks in strong sectors.
+Action: Built STOCK_SECTOR_MAP, SECTOR_INDICES, and get_sector_regimes() 50-SMA check.
 ------------------------------------------------------------
 [UPGRADE-005] Phase 5: Recommendation & Risk Decision Engine
-Reason: Raw table data lacked clear 'Why Enter' vs 'Why Avoid' decision intelligence
-        and concrete order execution parameters for traders.
-Action: 1. Added render_trade_decision_card() with transparent positive edge factors
-           and risk vetoes.
-        2. Created actionable trade status classifications: READY TO ENTER,
-           WATCHLIST / WAIT, and NO-TRADE / CAPITAL PROTECTION.
-        3. Built automated order execution tickets calculating exact quantity,
-           capital outlay, and rupee/dollar risk limits.
-Impact: Turns mechanical scans into actionable, institutional-grade trade decisions.
-Dependencies: streamlit, pandas, numpy.
+Reason: Raw table data lacked 'Why Enter' vs 'Why Avoid' decision cards.
+Action: Added render_trade_decision_card() and automated order execution tickets.
 ------------------------------------------------------------
 [UPGRADE-006] Phase 6: Options Analysis & Monitoring Engine
-Reason: Index and F&O options lacked quantitative volatility pricing (IV vs HV20),
-        Black-Scholes Greek sizing, and crashed when NSE public API was unreachable.
-Action: Added robust NoneType guards, anchored IV to India VIX fallback, computed
-        Delta/Theta Greeks, and integrated contract lot sizing.
-Impact: Guarantees zero crashes during NSE rate limits and sizes options capital.
-Dependencies: math, numpy, pandas.
+Reason: Index/F&O options lacked volatility pricing (IV vs HV20) and Greeks sizing.
+Action: Black-Scholes Greeks (Delta, Theta), ATM IV vs HV20 diagnostics, and lot sizer.
 ------------------------------------------------------------
 [UPGRADE-007] Phase 7: Portfolio Lifecycle State Machine & Analytics Engine
-Reason: Trade exits relied on basic static stops without systematic stage tracking,
-        and closed trades lacked win rate/expectancy analytics.
-Action: 1. Built 4-stage lifecycle state machine (HOLD, BREAKEVEN, TRAILING, EXIT).
-        2. Implemented Chandelier trailing stop (HH - 2.5x ATR) and breakeven ratcheting at +1R.
-        3. Built options multi-trigger monitor (Premium SL, Underlying SL, DTE <= 1 theta decay).
-        4. Added Desk 8 Journal Performance Dashboard (Win Rate, Profit Factor, Expectancy).
-Impact: Eliminates emotional exits and provides quantitative post-trade performance analytics.
-Dependencies: streamlit, pandas, numpy.
+Reason: Exits lacked systematic stage tracking and journal lacked win rate metrics.
+Action: 4-stage lifecycle state machine (HOLD, BREAKEVEN, TRAILING, EXIT), multi-currency ledger.
 ------------------------------------------------------------
-[FIX-01..12] Index-options strategy engine, exit engine and bug fixes — see CHANGELOG_FIX.md
-[ORDER-FIX] Re-ordered run_equity_scan() and render_scanner() before navigation router
-            to permanently resolve runtime NameError.
+[FIX-01..12] Index-options strategy engine, exit engine, and bug fixes.
+[FIX-13] Global Dependency Ordering: Positioned all ticker fetchers and data providers
+         before render_scanner to permanently resolve NameError.
 ============================================================
 """
 import streamlit as st
@@ -94,9 +50,10 @@ import warnings
 from datetime import datetime, timedelta, date, timezone
 from zoneinfo import ZoneInfo
 
-# Suppress internal third-party library deprecation warnings from console logs
+# Suppress third-party warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*inplace keyword in DataFrame.*")
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # Streamlit Page Configuration
 st.set_page_config(
@@ -189,13 +146,33 @@ def _f(x, default=np.nan):
     except Exception:
         return default
 
+def ist_today():
+    return datetime.now(ZoneInfo("Asia/Kolkata")).date()
+
 # ==============================================================================
-# DATA QUALITY, FRESHNESS & DIAGNOSTICS MANAGER
+# TICKER FETCHERS (DECLARED BEFORE SCANNER CALLS THEM)
+# ==============================================================================
+def fetch_indian_tickers(universe="Nifty 100"):
+    return [
+        "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "BHARTIARTL", 
+        "SBIN", "TMPV", "LT", "ITC", "AXISBANK", "MARUTI", "BAJFINANCE",
+        "SUNPHARMA", "TITAN", "ULTRACEMCO", "WIPRO", "POWERGRID", "NTPC", "M&M",
+        "INDUSTOWER", "ADANIENSOL", "ZYDUSLIFE", "ARE&M", "BEL", "TRENT",
+        "HINDALCO", "COALINDIA", "DRREDDY", "CIPLA", "ASIANPAINT", "BAJAJFINSV"
+    ]
+
+def fetch_us_tickers(universe="Curated leaders"):
+    return [
+        "NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "AVGO", "AMD", "COST", "NFLX", "PLTR", "JPM", "V",
+        "CRM", "INTC", "QCOM", "AMAT", "MU", "WMT", "UNH", "CAT", "PANW", "DELL", "CRWD", "GS", "LLY", "ORCL"
+    ]
+
+# ==============================================================================
+# DATA QUALITY & FRESHNESS ENGINE
 # ==============================================================================
 class DataQualityManager:
     @staticmethod
     def inspect_dataframe(df, market="IN"):
-        """[FIX-10] Judge freshness by trading sessions instead of absolute hours."""
         if df is None or df.empty:
             return {"status": "UNAVAILABLE", "badge": "🔴 UNAVAILABLE", "last_bar": "Never", "is_stale": True}
         last_d = pd.Timestamp(df.index[-1]).date()
@@ -216,7 +193,7 @@ class DataQualityManager:
         st.caption(f"**Data Status:** {diag['badge']} | **Source:** {source_label} | **Last Bar:** `{diag['last_bar']}`")
 
 # ==============================================================================
-# PERSISTENCE & STORAGE HELPERS
+# STORAGE & LOGGING
 # ==============================================================================
 def _ensure_ids(df):
     if "Row_ID" not in df.columns:
@@ -278,7 +255,7 @@ def log_to_journal(market, instrument, direction, entry, exit_p, qty, entry_date
     save_csv_data(st.session_state.journal, JOURNAL_FILE)
 
 # ==============================================================================
-# 1. MARKET DATA LAYER
+# DATA LAYER & HISTORY DOWNLOAD
 # ==============================================================================
 def _extract_ticker_frame(data, ticker):
     if data is None or len(data) == 0:
@@ -355,7 +332,7 @@ def projected_rel_volume(df, market):
     return vol / vol_avg, False
 
 # ==============================================================================
-# 2. TECHNICAL INDICATOR ENGINE
+# TECHNICAL INDICATOR ENGINE
 # ==============================================================================
 def calculate_sma(series, window=20):
     return series.rolling(window=window).mean()
@@ -364,10 +341,8 @@ def calculate_ema(series, span=20):
     return series.ewm(span=span, adjust=False).mean()
 
 def calculate_rsi(series, window=14):
-    """Wilder's smoothed RSI with flat-price protection."""
     if series.empty or series.nunique() <= 1:
         return pd.Series(50.0, index=series.index)
-    
     delta = series.diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
@@ -454,7 +429,7 @@ def add_indicators(df_in):
     return df
 
 # ==============================================================================
-# 3. PHASE 4: MARKET REGIME & SECTOR BREADTH ENGINE
+# MARKET REGIME & SECTOR BREADTH
 # ==============================================================================
 def regime_series(bench_df):
     c = bench_df["Close"]
@@ -524,7 +499,186 @@ def rs_proxy_rating(excess_63d_pct):
     return 25
 
 # ==============================================================================
-# 4. CONFLUENCE & SECTOR-AWARE SCORING ENGINE
+# NEWS SENTIMENT & CALENDARS
+# ==============================================================================
+FIN_LEXICON = {
+    "upgrade": 2.0, "upgrades": 2.0, "upgraded": 2.0, "downgrade": -2.2, "downgrades": -2.2, "downgraded": -2.2,
+    "beat": 1.6, "beats": 1.8, "miss": -1.8, "misses": -2.0, "missed": -1.8, "surge": 2.0, "surges": 2.0,
+    "soar": 2.2, "soars": 2.2, "rally": 1.6, "rallies": 1.6, "jumps": 1.6, "jump": 1.4, "gains": 1.2, "gain": 1.0,
+    "climbs": 1.2, "rises": 1.0, "rebound": 1.2, "rebounds": 1.2, "outperform": 1.8, "bullish": 2.0, "upbeat": 1.6,
+    "plunge": -2.6, "plunges": -2.6, "slump": -2.2, "slumps": -2.2, "tumble": -2.2, "tumbles": -2.2, "crash": -3.0,
+    "selloff": -2.0, "weak": -1.4, "loss": -1.6, "losses": -1.6, "fraud": -3.2, "probe": -1.6, "raid": -2.0
+}
+try:
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+    _VADER = SentimentIntensityAnalyzer()
+    _VADER.lexicon.update(FIN_LEXICON)
+except Exception:
+    _VADER = None
+
+def _headline_score(text):
+    if _VADER is not None:
+        return _VADER.polarity_scores(text)["compound"]
+    words = [w.strip(".,:;!?'\"()").lower() for w in text.split()]
+    return max(-1.0, min(1.0, sum(FIN_LEXICON.get(w, 0.0) for w in words) / 4.0))
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_live_news_sentiment(query, market="IN", max_items=10, max_age_days=7):
+    if market == "US":
+        q = urllib.parse.quote(f"{query} stock when:{max_age_days}d")
+        rss_url = f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
+    else:
+        q = urllib.parse.quote(f"{query} share price when:{max_age_days}d")
+        rss_url = f"https://news.google.com/rss/search?q={q}&hl=en-IN&gl=IN&ceid=IN:en"
+    try:
+        resp = requests.get(rss_url, timeout=6, headers={"User-Agent": "Mozilla/5.0"})
+        feed = feedparser.parse(resp.content)
+    except Exception:
+        feed = feedparser.parse(b"")
+    seen, items = set(), []
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    for e in feed.entries:
+        title = str(e.get("title", ""))
+        base = title.rsplit(" - ", 1)[0].strip()
+        key = base.lower()[:80]
+        if not base or key in seen:
+            continue
+        seen.add(key)
+        pub = e.get("published_parsed")
+        age = (now - datetime(*pub[:6])).total_seconds() / 86400 if pub else 3.0
+        if age > max_age_days:
+            continue
+        sc = _headline_score(base)
+        items.append({"headline": base, "score": round(sc, 2), "age_days": round(age, 1), "w": math.exp(-age / 3.0)})
+        if len(items) >= max_items:
+            break
+    wsum = sum(i["w"] for i in items)
+    avg = round(sum(i["score"] * i["w"] for i in items) / wsum, 2) if wsum else 0.0
+    label = "POSITIVE" if avg > 0.10 else ("NEGATIVE" if avg < -0.10 else "NEUTRAL")
+    return {"label": label, "score": avg, "count": len(items), "headlines": [i["headline"] for i in items], "items": items}
+
+@st.cache_data(ttl=43200, show_spinner=False)
+def get_next_earnings(ticker):
+    try:
+        cal = yf.Ticker(ticker).calendar
+        d = None
+        if isinstance(cal, dict):
+            d = cal.get("Earnings Date")
+            if isinstance(d, (list, tuple)):
+                d = d[0] if d else None
+        elif isinstance(cal, pd.DataFrame) and not cal.empty:
+            if "Earnings Date" in cal.index:
+                d = cal.loc["Earnings Date"].iloc[0]
+        if d is None:
+            return None
+        return pd.Timestamp(d).date().isoformat()
+    except Exception:
+        return None
+
+def days_until(iso):
+    if not iso:
+        return None
+    try:
+        return (date.fromisoformat(iso) - date.today()).days
+    except Exception:
+        return None
+
+# ==============================================================================
+# OPTION CHAIN & NSE PUBLIC APIS
+# ==============================================================================
+NSE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*", "Accept-Language": "en-US,en;q=0.9",
+}
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def nse_reachable():
+    try:
+        r = requests.get("https://www.nseindia.com", headers=NSE_HEADERS, timeout=4)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+def nse_get_json(path, params=None, referer="https://www.nseindia.com/option-chain"):
+    if not nse_reachable():
+        return None
+    try:
+        s = requests.Session()
+        s.headers.update(NSE_HEADERS)
+        s.get("https://www.nseindia.com", timeout=5)
+        s.headers["Referer"] = referer
+        r = s.get("https://www.nseindia.com" + path, params=params, timeout=7)
+        if r.status_code == 200 and r.text.strip().startswith(("{", "[")):
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_fii_dii_live():
+    js = nse_get_json("/api/fiidiiTradeReact", referer="https://www.nseindia.com/reports/fii-dii")
+    if isinstance(js, list) and js:
+        df = pd.DataFrame(js)
+        keep = [c for c in ["category", "date", "buyValue", "sellValue", "netValue"] if c in df.columns]
+        if keep:
+            return df[keep], "NSE"
+    try:
+        r = requests.get("https://www.moneycontrol.com/stocks/fii_dii_activity.php",
+                         headers={"User-Agent": NSE_HEADERS["User-Agent"]}, timeout=6)
+        if r.status_code == 200:
+            for tbl in pd.read_html(io.StringIO(r.text)):
+                col_str = " ".join([str(c) for c in tbl.columns])
+                if "FII" in col_str or "DII" in col_str:
+                    return tbl.dropna(how="all").head(5), "Moneycontrol"
+    except Exception:
+        pass
+    return None, None
+
+@st.cache_data(ttl=180, show_spinner=False)
+def fetch_option_chain(symbol, is_index=True, expiry=None):
+    info = nse_get_json("/api/option-chain-contract-info", {"symbol": symbol})
+    expiries = (info.get("expiryDates") if isinstance(info, dict) else None) or []
+    data, exp_used = None, (expiry if (expiry and expiry in expiries) else (expiries[0] if expiries else None))
+    if exp_used:
+        data = nse_get_json("/api/option-chain-v3",
+                            {"type": "Indices" if is_index else "Equity", "symbol": symbol, "expiry": exp_used})
+    if not data:
+        data = nse_get_json("/api/option-chain-indices" if is_index else "/api/option-chain-equities",
+                            {"symbol": symbol})
+    if not isinstance(data, dict) or "records" not in data:
+        return None
+    rec = data["records"]
+    expiries = expiries or rec.get("expiryDates", [])
+    exp_used = exp_used or (expiry if (expiry and expiry in expiries) else (expiries[0] if expiries else None))
+    rows = []
+    for d in rec.get("data", []):
+        exp = d.get("expiryDate") or d.get("expiryDates")
+        if exp_used and exp and exp != exp_used:
+            continue
+        ce, pe = d.get("CE") or {}, d.get("PE") or {}
+        rows.append({"strike": _f(d.get("strikePrice")),
+                     "ce_oi": _f(ce.get("openInterest"), 0), "ce_chg_oi": _f(ce.get("changeinOpenInterest"), 0),
+                     "ce_iv": _f(ce.get("impliedVolatility"), 0), "ce_ltp": _f(ce.get("lastPrice"), np.nan),
+                     "pe_oi": _f(pe.get("openInterest"), 0), "pe_chg_oi": _f(pe.get("changeinOpenInterest"), 0),
+                     "pe_iv": _f(pe.get("impliedVolatility"), 0), "pe_ltp": _f(pe.get("lastPrice"), np.nan)})
+    if not rows:
+        return None
+    ch = pd.DataFrame(rows).dropna(subset=["strike"]).sort_values("strike").reset_index(drop=True)
+    spot = _f(rec.get("underlyingValue"))
+    tot_ce, tot_pe = ch["ce_oi"].sum(), ch["pe_oi"].sum()
+    ks = ch["strike"].values
+    pain = [float((ch["ce_oi"] * np.maximum(0, k - ks)).sum() + (ch["pe_oi"] * np.maximum(0, ks - k)).sum()) for k in ks]
+    atm_row = ch.iloc[(ch["strike"] - spot).abs().argsort().iloc[0]] if spot == spot else None
+    ivs = [v for v in ([atm_row["ce_iv"], atm_row["pe_iv"]] if atm_row is not None else []) if v and v > 0]
+    return {"spot": spot, "expiry": exp_used, "expiries": expiries, "chain": ch,
+            "pcr": round(tot_pe / tot_ce, 2) if tot_ce else None,
+            "max_pain": float(ks[int(np.argmin(pain))]) if len(pain) else None,
+            "call_wall": float(ch.loc[ch["ce_oi"].idxmax(), "strike"]),
+            "put_wall": float(ch.loc[ch["pe_oi"].idxmax(), "strike"]),
+            "atm_iv": round(float(np.mean(ivs)), 2) if ivs else None}
+
+# ==============================================================================
+# CONFLUENCE & SETUP SCORER
 # ==============================================================================
 def score_setup(r, symbol="", direction="long", rs_rating=None, regime="NEUTRAL", sector_health=None, relvol=None, sentiment=None, earnings_days=None):
     L = direction == "long"
@@ -589,7 +743,7 @@ def score_setup(r, symbol="", direction="long", rs_rating=None, regime="NEUTRAL"
         if rpts:
             why.append(f"Leader RS rating {rs_rating:.0f}")
 
-    # LEADING SETUP CLASSIFICATION (10 pts)
+    # Setup classification (10 pts)
     h20, l20, bbw_rank = _f(r["High_20"]), _f(r["Low_20"]), _f(r["BBW_Rank"], 1.0)
     if L:
         pullback = (_f(r["Low"]) <= e20 + 0.35 * atr) and (c >= e20) and (c > o)
@@ -624,7 +778,7 @@ def score_setup(r, symbol="", direction="long", rs_rating=None, regime="NEUTRAL"
 
     score = 100.0 * pts / mx if mx else 0.0
 
-    # STRICT PENALTIES & EXTENSION VETOES
+    # Penalties
     ext = ((c - e20) if L else (e20 - c)) / atr
     if ext > 1.8:
         score -= 25
@@ -637,7 +791,6 @@ def score_setup(r, symbol="", direction="long", rs_rating=None, regime="NEUTRAL"
         score -= 15
         flags.append("RSI Overbought/Oversold exhaustion")
 
-    # Granular Sector Breadth Check
     stock_sector = STOCK_SECTOR_MAP.get(symbol)
     sec_trend = (sector_health or {}).get(stock_sector, "NEUTRAL") if stock_sector else None
 
@@ -649,12 +802,10 @@ def score_setup(r, symbol="", direction="long", rs_rating=None, regime="NEUTRAL"
             score -= 20
             flags.append("Market in RISK-OFF (High breakout failure rate)")
 
-    # News sentiment penalty integration
     if sentiment is not None and ((L and sentiment <= -0.3) or ((not L) and sentiment >= 0.3)):
         score -= 5
         flags.append("News sentiment against the trade")
 
-    # Event Risk (Earnings within 5 days)
     if earnings_days is not None and 0 <= earnings_days <= 5:
         score -= 15
         flags.append(f"Earnings in {earnings_days}d — binary gap risk!")
@@ -686,9 +837,6 @@ def position_size(capital, risk_pct, entry, stop):
         return 0
     return int(max(0, min((capital * risk_pct / 100.0) // risk_ps, capital // entry)))
 
-# ==============================================================================
-# PHASE 5: RECOMMENDATION & RISK DECISION ENGINE
-# ==============================================================================
 def render_trade_decision_card(row, market, capital, risk_pct):
     m = MARKETS[market]
     score = float(row["Score"])
@@ -704,7 +852,6 @@ def render_trade_decision_card(row, market, capital, risk_pct):
     risk_rupees = qty * abs(entry - stop)
     rr_ratio = abs(t1 - entry) / abs(entry - stop) if abs(entry - stop) > 0 else 0.0
 
-    # Decision Engine Classification Logic
     if score >= 60 and not any("EXTENDED" in f for f in flags) and rr_ratio >= 1.8:
         status_label = "🟢 READY TO ENTER (Confluence Validated)"
         status_desc = "Setup shows structural alignment, acceptable risk distance, and attractive reward:risk."
@@ -750,7 +897,7 @@ def render_trade_decision_card(row, market, capital, risk_pct):
     o2.success(f"**Target 2 (3R - Runner Exit):** {m['ccy']}{t2:,.2f}")
 
 # ==============================================================================
-# SCANNER LOGIC (ORDERED PROPERLY BEFORE NAVIGATION SECTIONS)
+# SCANNER LOGIC (DEFINED BEFORE DESK RENDERING)
 # ==============================================================================
 def cfg():
     return st.session_state.get("_cfg", {"min_score": 65, "atr_mult": 1.8, "risk_pct": 1.0,
@@ -853,7 +1000,6 @@ def render_scanner(market):
         st.info("No data returned. Please try again.")
         return
 
-    # View filtering logic
     view = res if show_all else res[res["Score"] >= c["min_score"]]
     st.caption(f"Scanned {sc['n']} symbols at {sc['ts']}. Showing {len(view)} candidate(s) (Cutoff score: {c['min_score']}).")
     
@@ -978,14 +1124,94 @@ def render_sizer(market):
             st.write(f"**Max Loss at Stop:** :red[-{m['ccy']}{qty * risk_per_unit:,.2f}]")
 
 # ==============================================================================
-# [FIX-01..05] PRO INDEX-OPTIONS STRATEGY ENGINE
+# INDEX STRATEGY ENGINE & GREEKS
 # ==============================================================================
-def ist_today():
-    """[FIX-12] Streamlit Cloud runs on UTC; expiry maths must use the IST calendar date."""
-    return datetime.now(ZoneInfo("Asia/Kolkata")).date()
+NSE_EXPIRY_HOLIDAYS = {date(2026, 10, 20), date(2026, 11, 10), date(2026, 11, 24)}
+
+def _roll_back_holiday(d):
+    while d in NSE_EXPIRY_HOLIDAYS or d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+def _last_weekday(y, m, wd):
+    d = date(y + (m == 12), (m % 12) + 1, 1) - timedelta(days=1)
+    while d.weekday() != wd:
+        d -= timedelta(days=1)
+    return d
+
+def computed_expiries(underlying, today=None, n=3):
+    now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+    today = today or now_ist.date()
+    market_closed_for_expiry = (now_ist.hour > 15 or (now_ist.hour == 15 and now_ist.minute >= 30))
+    min_date = today + timedelta(days=1) if market_closed_for_expiry else today
+    out = []
+    if underlying == "NIFTY":
+        days_ahead = (1 - today.weekday()) % 7
+        target = today + timedelta(days=days_ahead)
+        if target < min_date:
+            target += timedelta(days=7)
+        while len(out) < n:
+            e = _roll_back_holiday(target)
+            if e >= min_date and e not in out:
+                out.append(e)
+            target += timedelta(days=7)
+    else:
+        y, m = today.year, today.month
+        while len(out) < n:
+            d = _roll_back_holiday(_last_weekday(y, m, 1))
+            if d >= min_date and d not in out:
+                out.append(d)
+            m += 1
+            if m > 12:
+                y, m = y + 1, 1
+    return sorted(out)
+
+def pick_expiry(underlying, chain=None, min_dte=2):
+    cands = []
+    if chain and isinstance(chain, dict) and chain.get("expiries"):
+        for x in chain["expiries"]:
+            parsed = parse_nse_date(x)
+            if parsed and parsed >= ist_today():
+                cands.append(parsed)
+    if not cands:
+        cands = computed_expiries(underlying, n=4)
+        
+    today = ist_today()
+    for d in sorted(cands):
+        dte = (d - today).days
+        if dte >= min_dte:
+            return d, dte
+    latest = sorted(cands)[-1]
+    return latest, max(1, (latest - today).days)
+
+def parse_nse_date(s):
+    for fmt in ("%d-%b-%Y", "%Y-%m-%d", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(str(s), fmt).date()
+        except Exception:
+            continue
+    return None
+
+def _ncdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+def bs_greeks(S, K, T, r, sigma, typ="CE"):
+    T = max(T, 1 / 365)
+    sigma = max(sigma, 0.01)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    pdf = math.exp(-0.5 * d1 * d1) / math.sqrt(2 * math.pi)
+    if typ == "CE":
+        price = S * _ncdf(d1) - K * math.exp(-r * T) * _ncdf(d2)
+        delta = _ncdf(d1)
+        theta = (-S * pdf * sigma / (2 * math.sqrt(T)) - r * K * math.exp(-r * T) * _ncdf(d2)) / 365
+    else:
+        price = K * math.exp(-r * T) * _ncdf(-d2) - S * _ncdf(-d1)
+        delta = _ncdf(d1) - 1
+        theta = (-S * pdf * sigma / (2 * math.sqrt(T)) + r * K * math.exp(-r * T) * _ncdf(-d2)) / 365
+    return {"price": max(price, 0.05), "delta": delta, "theta": theta}
 
 def score_index_setup(r, direction="long", regime="NEUTRAL", sentiment=None):
-    """[FIX-01] Index confluence score (0-100). No 52-week / relative-strength / volume rules."""
     L = direction == "long"
     pts, mx, why, flags = 0.0, 0.0, [], []
 
@@ -1004,13 +1230,11 @@ def score_index_setup(r, direction="long", regime="NEUTRAL", sentiment=None):
     macd, sig, hist = _f(r["Hist"], 0), _f(r["MACD"], 0), _f(r["Signal"], 0)
     hist_prev = _f(r.get("Hist_Prev", np.nan), hist)
 
-    # Trend (35)
     stack = (c > e20 > e50) if L else (c < e20 < e50)
     add(stack, 15, "EMA stack aligned (price / EMA20 / EMA50)")
     add((c > s200) if L else (c < s200), 10, "Correct side of 200-SMA")
     add(_f(r["Weekly_Up" if L else "Weekly_Down"], 0) > 0, 10, "Weekly trend confirms")
     
-    # Momentum (25)
     add((macd > sig and hist >= hist_prev) if L else (macd < sig and hist <= hist_prev), 10, "MACD momentum expanding")
     if L:
         rpts = 10 if 45 <= rsi <= 65 else (5 if (40 <= rsi < 45 or 65 < rsi <= 70) else 0)
@@ -1022,7 +1246,6 @@ def score_index_setup(r, direction="long", regime="NEUTRAL", sentiment=None):
         why.append(f"RSI {rsi:.0f} in tradeable zone")
     add(adx >= 18 and ((pdi > mdi) if L else (mdi > pdi)), 5, f"ADX {adx:.0f} with DI alignment")
     
-    # Entry setup (20)
     ext = ((c - e20) if L else (e20 - c)) / atr
     ema_ok = (e20 > e50) if L else (e20 < e50)
     if L:
@@ -1072,7 +1295,6 @@ def score_index_setup(r, direction="long", regime="NEUTRAL", sentiment=None):
     return {"score": round(score, 1), "grade": grade, "setup": setup, "why": why, "flags": flags, "ext": ext}
 
 def _prob_above(S, K, T, sigma, r=0.0):
-    """Risk-neutral probability that the index expires above K."""
     T, sigma = max(T, 1 / 365), max(sigma, 0.01)
     d2 = (math.log(S / K) + (r - 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
     return _ncdf(d2)
@@ -1100,12 +1322,10 @@ def parse_legs(s):
     return out
 
 def net_from_prices(legs, prices, side):
-    """Net value of a structure: debit side = cost to own; credit side = cost to buy back."""
     raw = sum((p if l["side"] == "B" else -p) for l, p in zip(legs, prices))
     return raw if side == "DEBIT" else -raw
 
 def finalize_plan(plan, net, capital, risk_pct):
-    """[FIX-05] Single source of truth for stop/target/size from actual net premium."""
     lot, kind = plan["lot"], plan["kind"]
     if kind == "LONG OPTION":
         stop, target = net * plan["sl_ratio"], net * plan["tgt_ratio"]
@@ -1114,7 +1334,7 @@ def finalize_plan(plan, net, capital, risk_pct):
         w = plan["width"]
         stop, target = 0.5 * net, net + 0.6 * max(w - net, 0)
         plan_loss_u, max_loss_u, reward_u = net - stop, net, target - net
-    else:  # IRON CONDOR
+    else:
         w = plan["wing"]
         stop, target = 2.0 * net, 0.5 * net
         plan_loss_u, max_loss_u, reward_u = stop - net, w - net, net - target
@@ -1138,7 +1358,7 @@ def _index_iv(meta, chain, regime, hv):
 def _directional_plan(plan, dirn, entry_spot, last, meta, iv, iv_rich, chain_e, dte, c, event_risk):
     rf, step = MARKETS["IN"]["rf"], meta["step"]
     T = max(dte, 1) / 365
-    lv = compute_levels(last, "long" if dirn == "CE" else "short", c["atr_mult"], entry=entry_spot)  # [FIX-04] PE stop above spot
+    lv = compute_levels(last, "long" if dirn == "CE" else "short", c["atr_mult"], entry=entry_spot)
     em = entry_spot * iv / 100 * math.sqrt(max(dte, 1) / 365)
     t1_move = min(abs(lv["t1"] - entry_spot), em)
     sgn = 1 if dirn == "CE" else -1
@@ -1222,7 +1442,6 @@ def _condor_plan(plan, spot, meta, iv, chain_e, dte):
     return plan
 
 def build_index_plan(idx_name, meta, ind, regime, chain0, sentiment, c, event_risk):
-    """[FIX-02] Returns DIRECTIONAL / RANGE / WAIT / STAND ASIDE with a trade ticket."""
     last = ind.iloc[-1]
     spot = chain0["spot"] if (chain0 and chain0.get("spot") == chain0.get("spot") and chain0.get("spot")) else _f(last["Close"])
     lg = score_index_setup(last, "long", regime["label"], sentiment)
@@ -1287,7 +1506,6 @@ def build_index_plan(idx_name, meta, ind, regime, chain0, sentiment, c, event_ri
     return plan
 
 def render_index_plan(plan, c):
-    """[FIX-03] Displays strategy decision, full execution ticket, and dual-direction scoring."""
     mode = plan["mode"]
     lg, sh = plan["long"], plan["short"]
     k1, k2, k3, k4, k5 = st.columns(5)
@@ -1358,7 +1576,6 @@ def render_index_plan(plan, c):
         st.caption(f"Threshold for a directional trade: {plan['thr']} (sidebar).")
 
 def evaluate_option_position(row, use_live=True):
-    """[FIX-06] Exit engine for single options, debit spreads and iron condors."""
     und = str(row["Underlying"])
     is_index = und in UNDERLYING_YF
     df = get_history(UNDERLYING_YF.get(und, f"{und}.NS"), "2y")
@@ -1445,10 +1662,9 @@ def evaluate_option_position(row, use_live=True):
             "Exit Signal": status}
 
 # ==============================================================================
-# PHASE 7: PORTFOLIO LIFECYCLE & DYNAMIC EXIT ENGINE
+# ACTIVE EQUITY EXIT MONITOR
 # ==============================================================================
 def evaluate_equity_position(row, market):
-    """Phase 7: Multi-Stage Exit Engine with Breakeven Shift and Chandelier Trailing."""
     m = MARKETS[market]
     sym = str(row["Symbol"])
     df = get_history(f"{sym}{m['suffix']}", "2y")
@@ -1467,7 +1683,6 @@ def evaluate_equity_position(row, market):
         since = ind.tail(1)
     hh = float(since["High"].max())
     
-    # State Machine Trailing Logic
     trail = max(init_stop, sl)
     lifecycle_state = "HOLD"
     
@@ -1585,9 +1800,9 @@ st.session_state["_cfg"] = {
     "nse_live": True
 }
 
-# ##############################################################################
-# SECTION 1: FULL-MARKET EQUITY SCANNER (INDIAN MARKET)
-# ##############################################################################
+# ==============================================================================
+# SECTION ROUTING
+# ==============================================================================
 if app_mode == NAV[0]:
     st.title("📈 Indian Equities Multi-Indicator Swing Scanner")
     st.caption("Screens liquid NSE equities in real-time for early-stage leading setups.")
@@ -1599,19 +1814,13 @@ if app_mode == NAV[0]:
     with t_sizer:
         render_sizer("IN")
 
-# ##############################################################################
-# SECTION 2: ACTIVE EQUITY PORTFOLIO & EXIT ALERTS (INDIAN MARKET)
-# ##############################################################################
 elif app_mode == NAV[1]:
     st.title("🛡️ Active Equity Portfolio & Dynamic Exit Monitor (NSE)")
     render_equity_monitor("IN")
 
-# ##############################################################################
-# SECTION 3: HIGH-PROBABILITY OPTIONS TRADING DESK (NSE) - SAFE FALLBACK
-# ##############################################################################
 elif app_mode == NAV[2]:
     st.title("🎯 High-Probability Options Trading Desk (NSE)")
-    st.caption("Phase 6: Black-Scholes Greeks, IV vs. HV20 pricing, and directional spread intelligence.")
+    st.caption("Phase 6 & 7: Black-Scholes Greeks, Strategy Planner, and Sizing Engine.")
     c = cfg()
     opt_choice = st.radio("Choose Trading Segment:", ["Benchmark Indices (Nifty / Bank Nifty)", "Top F&O Momentum Stocks"],
                           horizontal=True, key="rb_options_segment_in")
@@ -1678,7 +1887,8 @@ elif app_mode == NAV[2]:
                     st.warning("Conditional (WAIT) ticket — add it only after price reaches the entry zone and you hold real fills.")
                 if st.button("Add to Options Exit Engine", key=f"btn_add_idx_{pid}", disabled=fin is None):
                     strikes = "/".join(str(int(l["strike"])) for l in plan["legs"])
-                    exp_short = parse_nse_date(plan["expiry"]).strftime("%d%b%y").upper()
+                    p_date = parse_nse_date(plan["expiry"])
+                    exp_short = p_date.strftime("%d%b%y").upper() if p_date else str(plan["expiry"])
                     new_row = pd.DataFrame([{
                         "Row_ID": uuid.uuid4().hex[:8], "Contract": f"{plan['idx']} {exp_short} {plan['strategy']} {strikes}",
                         "Underlying": plan["nse"], "Option_Type": plan["dirn"], "Strike": plan["legs"][0]["strike"],
@@ -1693,8 +1903,7 @@ elif app_mode == NAV[2]:
 
     else:
         st.subheader("Top F&O Momentum Stocks")
-        st.caption("Long (CALL) candidates only — this screen ranks stocks; confirm strike, lot size and premium on your broker's chain.")
-        st.caption("Phase 6: Multi-Indicator options momentum scanning on active F&O equities.")
+        st.caption("Long (CALL) candidates only — ranks momentum setups across F&O stocks.")
         if st.button("Run F&O Options Momentum Scan", key="btn_fno_options_scan"):
             with st.spinner("Screening F&O watchlist for high-probability setups..."):
                 fno_results, reg, _ = run_equity_scan(FNO_WATCHLIST[:15], "IN", c["min_score"], c["atr_mult"], check_earnings=True)
@@ -1703,13 +1912,9 @@ elif app_mode == NAV[2]:
                 else:
                     st.info("No single-stock F&O options met the strict confluence threshold today.")
 
-# ##############################################################################
-# SECTION 4: ACTIVE OPTIONS EXIT ALERT ENGINE (INDIAN MARKET)
-# ##############################################################################
 elif app_mode == NAV[3]:
     st.title("🛡️ Real-Time Options Exit Alert Engine (NSE)")
-    st.caption("[FIX-06] Premium stop/target (live NSE or your input), underlying invalidation, expiry and time stops — "
-               "for single options, debit spreads and iron condors.")
+    st.caption("Multi-leg exit engine: premium stop/target, underlying stop, and expiry guards.")
     c = cfg()
     port_df = st.session_state.opt_portfolio
 
@@ -1749,7 +1954,6 @@ elif app_mode == NAV[3]:
         st.info("No active options currently tracked.")
     else:
         st.markdown("#### Update current values (used when NSE live prices are unavailable)")
-        st.caption("Spreads/condors: enter the NET value — debit = what the spread is worth now; credit = cost to buy it back now.")
         ed = st.data_editor(
             port_df[["Row_ID", "Contract", "Side", "Entry_Premium", "Last_Premium"]].astype({"Entry_Premium": float, "Last_Premium": float}),
             disabled=["Row_ID", "Contract", "Side", "Entry_Premium"], hide_index=True, key="de_opt_prem")
@@ -1799,9 +2003,6 @@ elif app_mode == NAV[3]:
             save_csv_data(st.session_state.opt_portfolio, OPTIONS_PORTFOLIO_FILE)
             st.rerun()
 
-# ##############################################################################
-# SECTION 5: MARKET REGIME, INSTITUTIONAL FII/DII & SENTIMENT
-# ##############################################################################
 elif app_mode == NAV[4]:
     st.title("🏛️ Market Regime, Institutional Activity & Sentiment")
     for mk in ("IN", "US"):
@@ -1814,9 +2015,6 @@ elif app_mode == NAV[4]:
         st.caption(f"Source: {src}")
         show_df(fii_data)
 
-# ##############################################################################
-# SECTION 6: US EQUITIES SWING TRADING DESK
-# ##############################################################################
 elif app_mode == NAV[5]:
     st.title("🗽 US Equities Multi-Indicator Swing Desk")
     us_tab_scan, us_tab_single, us_tab_sz = st.tabs(["🚀 US Market Scanner", "🔍 US Stock Deep Dive", "🧮 Position Sizer"])
@@ -1827,23 +2025,16 @@ elif app_mode == NAV[5]:
     with us_tab_sz:
         render_sizer("US")
 
-# ##############################################################################
-# SECTION 7: ACTIVE US SWING PORTFOLIO & EXIT MONITOR
-# ##############################################################################
 elif app_mode == NAV[6]:
     st.title("🛡️ Active US Swing Portfolio & Exit Monitor (Wall Street)")
     render_equity_monitor("US")
 
-# ##############################################################################
-# SECTION 8: TRADE JOURNAL & PERFORMANCE ANALYTICS (PHASE 7 UPGRADED)
-# ##############################################################################
 elif app_mode == NAV[7]:
     st.title("📓 Trade Journal & Quantitative Performance Analytics")
     j = st.session_state.journal.copy()
     if j.empty:
         st.info("No closed trades logged yet. Settle an open trade from Desk 2 or Desk 7 to inspect analytics.")
     else:
-        # [FIX-09] Scorecard per market — rupee and dollar P&L separated
         j["PnL"] = pd.to_numeric(j["PnL"], errors="coerce").fillna(0.0)
         j["R_Multiple"] = pd.to_numeric(j["R_Multiple"], errors="coerce")
         st.subheader("Performance Scorecard (per market)")
